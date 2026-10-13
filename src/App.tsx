@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
 
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
@@ -17,7 +17,10 @@ type View =
 type Status = "Submitted" | "Under Review" | "Assigned" | "In Progress" | "Resolved" | "Closed";
 type Priority = "Not set" | "Low" | "Medium" | "High" | "Urgent";
 type Requester = { name: string; role: "Student" | "Faculty" };
-type Evidence = { name: string; size: string };
+/** previewUrl exists only in this browser session (object URL); nothing is uploaded. */
+type Evidence = { name: string; size: string; previewUrl?: string };
+/** start/end are the first day's block; the same block repeats for `days` consecutive days. */
+type Visit = { start: number; end: number; days?: number };
 
 type EventKind =
   | "submitted"
@@ -29,7 +32,9 @@ type EventKind =
   | "confirmed"
   | "adminClosed"
   | "reopened"
-  | "rejected";
+  | "rejected"
+  | "visitScheduled"
+  | "visitCancelled";
 type Action = Exclude<EventKind, "submitted">;
 
 type TimelineEvent = {
@@ -58,6 +63,7 @@ type Complaint = {
   team?: string;
   assignee?: string;
   attachment?: Evidence;
+  visit?: Visit;
   submittedAt: number;
   status: Status;
   history: TimelineEvent[];
@@ -114,6 +120,8 @@ const rules: Record<Action, { from: Status[]; roles: Role[] }> = {
   adminClosed: { from: ["Resolved"], roles: ["admin"] },
   reopened: { from: ["Resolved"], roles: ["student", "admin"] },
   rejected: { from: ["Submitted", "Under Review"], roles: ["admin"] },
+  visitScheduled: { from: ["Assigned", "In Progress"], roles: ["admin"] },
+  visitCancelled: { from: ["Assigned", "In Progress"], roles: ["admin"] },
 };
 
 /** null = status does not change (reassignment). */
@@ -128,6 +136,8 @@ const resultStatus: Record<EventKind, Status | null> = {
   adminClosed: "Closed",
   reopened: "In Progress",
   rejected: "Closed",
+  visitScheduled: null,
+  visitCancelled: null,
 };
 
 function eventTitle(kind: EventKind, staff?: string) {
@@ -152,6 +162,10 @@ function eventTitle(kind: EventKind, staff?: string) {
       return "Reopened";
     case "rejected":
       return "Rejected — not actionable";
+    case "visitScheduled":
+      return "Visit scheduled";
+    case "visitCancelled":
+      return "Visit cancelled";
   }
 }
 
@@ -203,6 +217,44 @@ function timeAgo(ms: number) {
   const days = Math.floor(diff / DAY);
   return days === 1 ? "yesterday" : `${days} days ago`;
 }
+/** Placeholder working hours for the prototype — not a confirmed campus timetable. */
+const WORK_START_HOUR = 9;
+const WORK_END_HOUR = 17;
+const VISIT_MINUTES = 60;
+
+const fmtTime = (ms: number) => new Date(ms).toLocaleTimeString("en-IN", { hour: "2-digit", minute: "2-digit", hour12: false });
+function fmtSlot(v: Visit) {
+  const days = v.days ?? 1;
+  const day = new Date(v.start).toLocaleDateString("en-IN", { weekday: "short", day: "numeric", month: "short" });
+  if (days === 1) return `${day}, ${fmtTime(v.start)}–${fmtTime(v.end)}`;
+  const last = new Date(v.start + (days - 1) * DAY).toLocaleDateString("en-IN", { weekday: "short", day: "numeric", month: "short" });
+  return `${day} – ${last}, ${fmtTime(v.start)}–${fmtTime(v.end)} each day (${days} days)`;
+}
+/** Every individual day-block a visit occupies. */
+function visitBlocks(v: Visit): Array<{ start: number; end: number }> {
+  return Array.from({ length: v.days ?? 1 }, (_, i) => {
+    const s = new Date(v.start);
+    s.setDate(s.getDate() + i);
+    return { start: s.getTime(), end: s.getTime() + (v.end - v.start) };
+  });
+}
+function dayAt(base: Date, dayOffset: number, hour: number) {
+  const d = new Date(base);
+  d.setDate(d.getDate() + dayOffset);
+  d.setHours(hour, 0, 0, 0);
+  return d.getTime();
+}
+function toInputDate(ms: number) {
+  const d = new Date(ms);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+}
+const overlaps = (a: Visit, b: Visit) =>
+  visitBlocks(a).some((x) => visitBlocks(b).some((y) => x.start < y.end && y.start < x.end));
+const hasActiveVisit = (i: Complaint) => !!i.visit && (i.status === "Assigned" || i.status === "In Progress");
+function busyFor(staff: string, items: Complaint[], excludeId?: string): Visit[] {
+  return items.filter((i) => i.assignee === staff && i.id !== excludeId && hasActiveVisit(i)).map((i) => i.visit as Visit);
+}
+
 function greeting() {
   const h = new Date().getHours();
   return h < 12 ? "Good morning" : h < 17 ? "Good afternoon" : "Good evening";
@@ -220,7 +272,12 @@ function formatLocation(place: { building: string; floor: string; room: string }
 }
 
 type SeedEvent = [EventKind, number, { note?: string; reason?: string; by?: Requester | "admin"; evidence?: Evidence }?];
-type Seed = Omit<Complaint, "status" | "history" | "submittedAt" | "location"> & { hoursAgo: number; events: SeedEvent[] };
+type Seed = Omit<Complaint, "status" | "history" | "submittedAt" | "location" | "visit"> & {
+  hoursAgo: number;
+  events: SeedEvent[];
+  /** [days from today, start hour] */
+  visitAt?: [number, number];
+};
 
 const seeds: Seed[] = [
   {
@@ -252,7 +309,8 @@ const seeds: Seed[] = [
     team: "Plumbing",
     assignee: "Suresh Pawar",
     hoursAgo: 20,
-    events: [["submitted", 0], ["reviewStarted", 1], ["assigned", 1.5]],
+    visitAt: [1, 10],
+    events: [["submitted", 0], ["reviewStarted", 1], ["assigned", 1.5], ["visitScheduled", 1.6]],
   },
   {
     id: "CC-2026-0103",
@@ -344,7 +402,8 @@ const seeds: Seed[] = [
     team: "Electrical",
     assignee: "Ramesh Jadhav",
     hoursAgo: 9,
-    events: [["submitted", 0], ["reviewStarted", 1], ["assigned", 2]],
+    visitAt: [1, 9],
+    events: [["submitted", 0], ["reviewStarted", 1], ["assigned", 2], ["visitScheduled", 2.1]],
   },
   {
     id: "CC-2026-0108",
@@ -382,6 +441,9 @@ function buildSeed(seed: Seed): Complaint {
   const submittedAt = now - seed.hoursAgo * HOUR;
   const history: TimelineEvent[] = [];
   let status: Status = "Submitted";
+  const visit: Visit | undefined = seed.visitAt
+    ? { start: dayAt(new Date(now), seed.visitAt[0], seed.visitAt[1]), end: dayAt(new Date(now), seed.visitAt[0], seed.visitAt[1]) + VISIT_MINUTES * 60 * 1000 }
+    : undefined;
   for (const [kind, offset, extra = {}] of seed.events) {
     const at = Math.min(submittedAt + offset * HOUR, now - 5 * 60 * 1000);
     status = resultStatus[kind] ?? status;
@@ -394,7 +456,7 @@ function buildSeed(seed: Seed): Complaint {
         : { name: ADMIN_NAME, role: "Administrator" };
     history.push({
       kind,
-      title: eventTitle(kind, seed.assignee),
+      title: kind === "visitScheduled" && visit ? `Visit scheduled: ${fmtSlot(visit)}` : eventTitle(kind, seed.assignee),
       status,
       at,
       by: person.name,
@@ -407,13 +469,15 @@ function buildSeed(seed: Seed): Complaint {
             ? `Team: ${seed.team}.`
             : kind === "submitted" && seed.attachment
               ? "Submitted with evidence attached."
-              : undefined),
+              : kind === "visitScheduled"
+                ? `${seed.assignee} at ${formatLocation(seed)}.`
+                : undefined),
       reason: extra.reason,
       evidence: extra.evidence,
     });
   }
-  const { hoursAgo: _h, events: _e, ...rest } = seed;
-  return { ...rest, location: formatLocation(seed), submittedAt, status, history };
+  const { hoursAgo: _h, events: _e, visitAt: _v, ...rest } = seed;
+  return { ...rest, location: formatLocation(seed), submittedAt, status, history, visit };
 }
 
 const initialComplaints: Complaint[] = seeds.map(buildSeed).sort((a, b) => b.submittedAt - a.submittedAt);
@@ -655,6 +719,26 @@ function formatSize(bytes: number) {
   return bytes < 1024 * 1024 ? `${Math.max(1, Math.round(bytes / 1024))} KB` : `${(bytes / 1024 / 1024).toFixed(1)} MB`;
 }
 
+/** Small square preview, or a file icon for PDFs / files without a session preview. */
+function EvidenceThumb({ evidence, size = "size-10", tone = "blue" }: { evidence: Evidence; size?: string; tone?: "blue" | "emerald" }) {
+  if (evidence.previewUrl) {
+    return <img alt={`Preview of ${evidence.name}`} className={`${size} shrink-0 rounded-lg object-cover ring-1 ring-slate-200 dark:ring-slate-700`} src={evidence.previewUrl} />;
+  }
+  return (
+    <span
+      className={`grid ${size} shrink-0 place-items-center rounded-lg bg-white dark:bg-slate-900 ${
+        tone === "emerald" ? "text-emerald-600 dark:text-emerald-400" : "text-blue-600 dark:text-blue-400"
+      }`}
+    >
+      <Icon name="file" />
+    </span>
+  );
+}
+
+function previewFor(file: File) {
+  return file.type.startsWith("image/") ? URL.createObjectURL(file) : undefined;
+}
+
 /** Compact evidence picker used by maintenance (same rules as the report form). */
 function EvidencePicker({ value, onChange }: { value: Evidence | null; onChange: (file: Evidence | null) => void }) {
   const [error, setError] = useState("");
@@ -662,14 +746,18 @@ function EvidencePicker({ value, onChange }: { value: Evidence | null; onChange:
   if (value) {
     return (
       <div className="flex items-center gap-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 p-3">
-        <span className="grid size-9 place-items-center rounded-lg bg-white dark:bg-slate-900 text-blue-600 dark:text-blue-400">
-          <Icon name="file" className="size-4" />
-        </span>
+        <EvidenceThumb evidence={value} size="size-12" />
         <div className="min-w-0 flex-1">
           <p className="truncate text-sm font-semibold text-slate-800 dark:text-slate-100">{value.name}</p>
-          <p className="text-xs text-slate-500 dark:text-slate-400">{value.size}</p>
+          <p className="text-xs text-slate-500 dark:text-slate-400">{value.size} · preview only, not uploaded</p>
         </div>
-        <Button onClick={() => onChange(null)} variant="ghost">
+        <Button
+          onClick={() => {
+            if (value.previewUrl) URL.revokeObjectURL(value.previewUrl);
+            onChange(null);
+          }}
+          variant="ghost"
+        >
           Remove
         </Button>
       </div>
@@ -695,7 +783,7 @@ function EvidencePicker({ value, onChange }: { value: Evidence | null; onChange:
               return;
             }
             setError("");
-            onChange({ name: file.name, size: formatSize(file.size) });
+            onChange({ name: file.name, size: formatSize(file.size), previewUrl: previewFor(file) });
           }}
           ref={inputRef}
           type="file"
@@ -1203,7 +1291,7 @@ function StudentDashboard({
   );
 }
 
-type NewComplaint = { category: string; building: string; floor: string; room: string; description: string; file: File | null };
+type NewComplaint = { category: string; building: string; floor: string; room: string; description: string; file: File | null; previewUrl?: string };
 
 function ReportForm({ onSubmit }: { onSubmit: (data: NewComplaint) => void }) {
   const [category, setCategory] = useState("");
@@ -1215,23 +1303,42 @@ function ReportForm({ onSubmit }: { onSubmit: (data: NewComplaint) => void }) {
   const [fileError, setFileError] = useState("");
   const [errors, setErrors] = useState<Record<string, string>>({});
   const [dragging, setDragging] = useState(false);
+  const [previewUrl, setPreviewUrl] = useState<string | undefined>();
   const inputRef = useRef<HTMLInputElement>(null);
+  const previewRef = useRef<string | undefined>(undefined);
+  const submittedRef = useRef(false);
+
+  const setPreview = (url?: string) => {
+    if (previewRef.current) URL.revokeObjectURL(previewRef.current);
+    previewRef.current = url;
+    setPreviewUrl(url);
+  };
+  // Free the preview if the form is left without submitting
+  useEffect(
+    () => () => {
+      if (!submittedRef.current && previewRef.current) URL.revokeObjectURL(previewRef.current);
+    },
+    [],
+  );
 
   const chooseFile = (selected?: File) => {
     if (!selected) return;
     const problem = validateFile(selected);
     if (problem) {
       setFile(null);
+      setPreview(undefined);
       setFileError(problem);
       if (inputRef.current) inputRef.current.value = "";
       return;
     }
     setFileError("");
     setFile(selected);
+    setPreview(previewFor(selected));
   };
 
   const clearFile = () => {
     setFile(null);
+    setPreview(undefined);
     setFileError("");
     if (inputRef.current) inputRef.current.value = "";
   };
@@ -1246,7 +1353,8 @@ function ReportForm({ onSubmit }: { onSubmit: (data: NewComplaint) => void }) {
     if (description.trim().length < 10) next.description = "Please describe the issue in at least 10 characters.";
     setErrors(next);
     if (Object.keys(next).length || fileError) return;
-    onSubmit({ category, building, floor, room: room.trim(), description: description.trim(), file });
+    submittedRef.current = true; // the new complaint now owns the preview
+    onSubmit({ category, building, floor, room: room.trim(), description: description.trim(), file, previewUrl });
   };
 
   const invalid = (key: string) => (errors[key] ? "border-red-300 dark:border-red-500/50 focus:border-red-500 focus:ring-red-50 dark:focus:ring-red-500/30" : "");
@@ -1333,12 +1441,10 @@ function ReportForm({ onSubmit }: { onSubmit: (data: NewComplaint) => void }) {
             <span className="mb-2 block text-sm font-semibold text-slate-700 dark:text-slate-200">Add supporting evidence (optional)</span>
             {file ? (
               <div className="flex items-center gap-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 p-3">
-                <span className="grid size-10 place-items-center rounded-lg bg-white dark:bg-slate-900 text-blue-600 dark:text-blue-400">
-                  <Icon name="file" />
-                </span>
+                <EvidenceThumb evidence={{ name: file.name, size: formatSize(file.size), previewUrl }} size="size-16" />
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-sm font-semibold text-slate-800 dark:text-slate-100">{file.name}</p>
-                  <p className="text-xs text-slate-500 dark:text-slate-400">{formatSize(file.size)} · Ready to attach</p>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">{formatSize(file.size)} · Ready to attach · preview only, not uploaded</p>
                 </div>
                 <Button onClick={clearFile} variant="ghost">
                   Remove
@@ -1572,10 +1678,11 @@ function WorkflowStepper({ item }: { item: Complaint }) {
   );
 }
 
+type ExtraEvent = { kind: Action; title: string; note?: string };
 type ActFn = (
   id: string,
   action: Action,
-  payload?: { note?: string; reason?: string; evidence?: Evidence; patch?: Partial<Complaint> },
+  payload?: { note?: string; reason?: string; evidence?: Evidence; patch?: Partial<Complaint>; title?: string; extra?: ExtraEvent[] },
 ) => boolean;
 
 function Panel({ title, children }: { title: string; children: ReactNode }) {
@@ -1589,6 +1696,132 @@ function Panel({ title, children }: { title: string; children: ReactNode }) {
 
 function ReadOnlyNote({ children }: { children: ReactNode }) {
   return <p className="rounded-xl bg-slate-50 dark:bg-slate-950 p-3 text-sm leading-6 text-slate-600 dark:text-slate-300">{children}</p>;
+}
+
+/** Optional visit booking: day, length, number of days, then a free start time for the chosen staff member. */
+function VisitPicker({
+  staff,
+  busy,
+  value,
+  onChange,
+}: {
+  staff: string;
+  busy: Visit[];
+  value: Visit | null;
+  onChange: (v: Visit | null) => void;
+}) {
+  const now = Date.now();
+  const [day, setDay] = useState(() => toInputDate(value?.start ?? dayAt(new Date(), 1, 0)));
+  const [hours, setHours] = useState(() => (value ? Math.round((value.end - value.start) / HOUR) : 1));
+  const [days, setDays] = useState(() => value?.days ?? 1);
+  const [y, m, d] = day.split("-").map(Number);
+  const base = new Date(y, (m || 1) - 1, d || 1);
+  const slots: Array<Visit & { taken: boolean }> = [];
+  for (let h = WORK_START_HOUR; h + hours <= WORK_END_HOUR; h++) {
+    const start = dayAt(base, 0, h);
+    if (start <= now) continue;
+    const slot: Visit = { start, end: start + hours * HOUR, days };
+    slots.push({ ...slot, taken: busy.some((b) => overlaps(b, slot)) });
+  }
+  const reset = () => onChange(null);
+  return (
+    <div className="space-y-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 p-3">
+      <Field hint={`Optional. Hours ${WORK_START_HOUR}:00–${WORK_END_HOUR}:00 are a placeholder for the prototype.`} label={days > 1 ? "First visit day" : "Visit day"}>
+        <input
+          className={fieldClass}
+          max={toInputDate(dayAt(new Date(), 14, 0))}
+          min={toInputDate(now)}
+          onChange={(event) => {
+            if (event.target.value) {
+              setDay(event.target.value);
+              reset();
+            }
+          }}
+          type="date"
+          value={day}
+        />
+      </Field>
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Visit length">
+          <select
+            className={fieldClass}
+            onChange={(event) => {
+              setHours(Number(event.target.value));
+              reset();
+            }}
+            value={hours}
+          >
+            <option value={1}>1 hour</option>
+            <option value={2}>2 hours</option>
+            <option value={3}>3 hours</option>
+            <option value={4}>4 hours (half day)</option>
+          </select>
+        </Field>
+        <Field label="Number of days">
+          <select
+            className={fieldClass}
+            onChange={(event) => {
+              setDays(Number(event.target.value));
+              reset();
+            }}
+            value={days}
+          >
+            {[1, 2, 3, 4, 5].map((n) => (
+              <option key={n} value={n}>
+                {n === 1 ? "1 day" : `${n} days`}
+              </option>
+            ))}
+          </select>
+        </Field>
+      </div>
+      <p className="text-xs font-semibold text-slate-700 dark:text-slate-200">
+        Start time{days > 1 ? " (same time each day)" : ""} for {staff}
+      </p>
+      {slots.length ? (
+        <div aria-label="Visit start time" className="flex flex-wrap gap-2" role="group">
+          {slots.map((slot) => {
+            const selected = value?.start === slot.start && (value.days ?? 1) === days && value.end === slot.end;
+            const range = `${fmtTime(slot.start)}–${fmtTime(slot.end)}`;
+            return (
+              <button
+                aria-label={`${fmtTime(slot.start)} to ${fmtTime(slot.end)}, ${slot.taken ? "booked" : "free"}`}
+                aria-pressed={selected}
+                className={`rounded-lg border px-3 py-2 text-sm font-semibold transition disabled:cursor-not-allowed ${
+                  selected
+                    ? "border-blue-600 bg-blue-600 text-white"
+                    : slot.taken
+                      ? "border-slate-200 dark:border-slate-800 bg-slate-100 dark:bg-slate-800 text-slate-400 dark:text-slate-500 line-through"
+                      : "border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 text-slate-700 dark:text-slate-200 hover:border-blue-400"
+                }`}
+                disabled={slot.taken}
+                key={slot.start}
+                onClick={() => onChange(selected ? null : { start: slot.start, end: slot.end, days })}
+                type="button"
+              >
+                {range}
+              </button>
+            );
+          })}
+        </div>
+      ) : (
+        <p className="text-sm text-slate-500 dark:text-slate-400">No start times left on this day for a {hours}-hour visit. Choose another day or a shorter visit.</p>
+      )}
+      <p className="text-xs text-slate-500 dark:text-slate-400">
+        {value ? (
+          <>
+            Selected: <span className="font-semibold text-slate-700 dark:text-slate-200">{fmtSlot(value)}</span> ·{" "}
+            <button className="font-semibold text-blue-700 dark:text-blue-300 underline" onClick={reset} type="button">
+              clear
+            </button>
+          </>
+        ) : days > 1 ? (
+          "Crossed-out times clash with another visit on at least one of the selected days."
+        ) : (
+          "Crossed-out times clash with another visit for this staff member."
+        )}
+      </p>
+    </div>
+  );
 }
 
 function AssignFields({
@@ -1633,7 +1866,9 @@ function AssignFields({
   );
 }
 
-function AdminActions({ item, act }: { item: Complaint; act: ActFn }) {
+function AdminActions({ item, items, act }: { item: Complaint; items: Complaint[]; act: ActFn }) {
+  const [visit, setVisit] = useState<Visit | null>(null);
+  const [visitMode, setVisitMode] = useState<"" | "edit" | "cancel">("");
   const [priority, setPriority] = useState<Priority | "">(item.priority === "Not set" ? "" : item.priority);
   const [team, setTeam] = useState(item.team ?? categoryTeam[item.category] ?? "General Maintenance");
   const [staff, setStaff] = useState(item.assignee ?? "");
@@ -1694,13 +1929,28 @@ function AdminActions({ item, act }: { item: Complaint; act: ActFn }) {
     return (
       <Panel title="Assign">
         <p className="text-xs text-slate-500 dark:text-slate-400">Default team suggested from the category ({item.category}).</p>
-        <AssignFields setStaff={setStaff} setTeam={setTeam} staff={staff} team={team} />
+        <AssignFields
+          setStaff={(v) => {
+            setStaff(v);
+            setVisit(null);
+          }}
+          setTeam={setTeam}
+          staff={staff}
+          team={team}
+        />
+        {staff && <VisitPicker busy={busyFor(staff, items, item.id)} key={staff} onChange={setVisit} staff={staff} value={visit} />}
         <Button
           className="w-full"
           disabled={!staff}
-          onClick={() => act(item.id, "assigned", { note: `Team: ${team}.`, patch: { team, assignee: staff } })}
+          onClick={() =>
+            act(item.id, "assigned", {
+              note: `Team: ${team}.`,
+              patch: { team, assignee: staff, visit: visit ?? undefined },
+              extra: visit ? [{ kind: "visitScheduled", title: `Visit scheduled: ${fmtSlot(visit)}`, note: `${staff} at ${item.location}.` }] : [],
+            })
+          }
         >
-          Assign complaint
+          {visit ? "Assign and book visit" : "Assign complaint"}
         </Button>
         {rejectBlock}
       </Panel>
@@ -1708,27 +1958,93 @@ function AdminActions({ item, act }: { item: Complaint; act: ActFn }) {
   }
 
   if (item.status === "Assigned" || item.status === "In Progress") {
+    const current = item.visit;
+    const reassigning = !!staff && staff !== item.assignee;
     return (
+      <>
+      <Panel title="Maintenance visit">
+        {current && visitMode === "" && (
+          <>
+            <ReadOnlyNote>
+              Booked for <span className="font-semibold text-slate-800 dark:text-slate-100">{fmtSlot(current)}</span> with {item.assignee}.
+            </ReadOnlyNote>
+            <div className="grid grid-cols-2 gap-2">
+              <Button onClick={() => setVisitMode("edit")} variant="secondary">
+                Change time
+              </Button>
+              <Button onClick={() => setVisitMode("cancel")} variant="danger">
+                Cancel visit
+              </Button>
+            </div>
+          </>
+        )}
+        {current && visitMode === "cancel" && (
+          <ReasonForm
+            confirmLabel="Cancel visit"
+            label="Reason for cancelling"
+            onCancel={() => setVisitMode("")}
+            onConfirm={(reason) => act(item.id, "visitCancelled", { title: `Visit cancelled: ${fmtSlot(current)}`, reason, patch: { visit: undefined } })}
+            placeholder="e.g. Room is locked for exams that day."
+            variant="danger"
+          />
+        )}
+        {(!current || visitMode === "edit") && (
+          <>
+            {!current && <p className="text-xs text-slate-500 dark:text-slate-400">No visit booked yet for {item.assignee}.</p>}
+            <VisitPicker busy={busyFor(item.assignee ?? "", items, item.id)} onChange={setVisit} staff={item.assignee ?? ""} value={visit} />
+            <div className="flex gap-2">
+              <Button
+                className="flex-1"
+                disabled={!visit}
+                onClick={() =>
+                  visit &&
+                  act(item.id, "visitScheduled", {
+                    title: `Visit ${current ? "rescheduled" : "scheduled"}: ${fmtSlot(visit)}`,
+                    note: current ? `Previously ${fmtSlot(current)}.` : `${item.assignee} at ${item.location}.`,
+                    patch: { visit },
+                  })
+                }
+              >
+                {current ? "Save new time" : "Book visit"}
+              </Button>
+              {current && (
+                <Button onClick={() => setVisitMode("")} variant="secondary">
+                  Back
+                </Button>
+              )}
+            </div>
+          </>
+        )}
+      </Panel>
       <Panel title="Reassign">
         <p className="text-xs text-slate-500 dark:text-slate-400">
           Currently with <span className="font-semibold text-slate-700 dark:text-slate-200">{item.assignee}</span> ({item.team}). Reassigning keeps the status as{" "}
           {item.status}.
         </p>
         <AssignFields setStaff={setStaff} setTeam={setTeam} staff={staff} team={team} />
+        {reassigning && current && (
+          <p className="text-xs font-medium text-orange-700 dark:text-orange-300">Reassigning cancels the visit booked for {fmtSlot(current)}.</p>
+        )}
         <Button
           className="w-full"
-          disabled={!staff || staff === item.assignee}
-          onClick={() =>
+          disabled={!reassigning}
+          onClick={() => {
+            const extra: ExtraEvent[] = current
+              ? [{ kind: "visitCancelled", title: `Visit cancelled: ${fmtSlot(current)}`, note: `Cancelled because the complaint moved to ${staff}.` }]
+              : [];
             act(item.id, "reassigned", {
               note: `From ${item.assignee} to ${staff} (${team}).`,
-              patch: { team, assignee: staff },
-            })
-          }
+              patch: { team, assignee: staff, visit: undefined },
+              extra,
+            });
+          }}
           variant="secondary"
         >
           Reassign
         </Button>
+        {reassigning && <p className="text-xs text-slate-500 dark:text-slate-400">You can book a visit for {staff} after reassigning.</p>}
       </Panel>
+      </>
     );
   }
 
@@ -1892,6 +2208,11 @@ function NextStep({ item, role, user }: { item: Complaint; role: Role; user: str
           {step.yours ? "Your next step:" : "Next step:"}
         </span>
         {step.text}
+        {hasActiveVisit(item) && item.visit && (
+          <span className="mt-1.5 flex items-center gap-1.5 font-semibold text-slate-900 dark:text-slate-50">
+            <Icon className="size-4 text-blue-600 dark:text-blue-400" name="clock" /> Visit booked: {fmtSlot(item.visit)}
+          </span>
+        )}
       </p>
       <p className="shrink-0 text-xs text-slate-500 dark:text-slate-400">
         Last update {timeAgo(last.at)} by {last.by}
@@ -1904,12 +2225,14 @@ function ComplaintDetail({
   role,
   user,
   item,
+  items,
   navigate,
   act,
 }: {
   role: Role;
   user: string;
   item: Complaint;
+  items: Complaint[];
   navigate: (view: View) => void;
   act: ActFn;
 }) {
@@ -1967,12 +2290,13 @@ function ComplaintDetail({
             </div>
             {item.attachment && (
               <div className="mt-5 flex items-center gap-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 p-3">
-                <span className="grid size-10 place-items-center rounded-lg bg-white dark:bg-slate-900 text-blue-600 dark:text-blue-400">
-                  <Icon name="file" />
-                </span>
+                <EvidenceThumb evidence={item.attachment} size={item.attachment.previewUrl ? "size-20" : "size-10"} />
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-sm font-semibold text-slate-800 dark:text-slate-100">{item.attachment.name}</p>
-                  <p className="text-xs text-slate-500 dark:text-slate-400">{item.attachment.size} · Evidence from requester · file name only, not uploaded in this prototype</p>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">
+                    {item.attachment.size} · Evidence from requester ·{" "}
+                    {item.attachment.previewUrl ? "preview from this browser session, not uploaded" : "file name only, not uploaded in this prototype"}
+                  </p>
                 </div>
               </div>
             )}
@@ -1988,12 +2312,12 @@ function ComplaintDetail({
               <p className="mt-3 text-sm leading-7 text-slate-700 dark:text-slate-200">{resolution.note}</p>
               {resolution.evidence ? (
                 <div className="mt-4 flex items-center gap-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 p-3">
-                  <span className="grid size-10 place-items-center rounded-lg bg-white dark:bg-slate-900 text-emerald-600 dark:text-emerald-400">
-                    <Icon name="file" />
-                  </span>
+                  <EvidenceThumb evidence={resolution.evidence} size={resolution.evidence.previewUrl ? "size-20" : "size-10"} tone="emerald" />
                   <div className="min-w-0 flex-1">
                     <p className="truncate text-sm font-semibold text-slate-800 dark:text-slate-100">{resolution.evidence.name}</p>
-                    <p className="text-xs text-slate-500 dark:text-slate-400">{resolution.evidence.size} · Evidence from maintenance · file name only, not uploaded in this prototype</p>
+                    <p className="text-xs text-slate-500 dark:text-slate-400">{resolution.evidence.size} · Evidence from maintenance ·{" "}
+                      {resolution.evidence.previewUrl ? "preview from this browser session, not uploaded" : "file name only, not uploaded in this prototype"}
+                    </p>
                   </div>
                 </div>
               ) : (
@@ -2039,7 +2363,7 @@ function ComplaintDetail({
           </section>
         </div>
         <aside className="order-first space-y-5 xl:order-none">
-          {role === "admin" && <AdminActions act={act} item={item} key={`${item.id}-${item.status}-${item.history.length}`} />}
+          {role === "admin" && <AdminActions act={act} item={item} items={items} key={`${item.id}-${item.status}-${item.history.length}`} />}
           {role === "maintenance" && <MaintenanceActions act={act} item={item} key={`${item.id}-${item.status}`} user={user} />}
           <section className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-5">
             <h2 className="font-bold text-slate-900 dark:text-slate-50">{role === "student" ? "Assigned staff" : "Requester"}</h2>
@@ -2240,7 +2564,8 @@ function Assignments({ items, onOpen }: { items: Complaint[]; onOpen: (id: strin
               <div className="mt-5 flex items-center justify-between border-t border-slate-100 dark:border-slate-800 pt-4">
                 <ComplaintStatus item={item} />
                 <span className="flex items-center gap-1 text-xs font-semibold text-slate-500 dark:text-slate-400">
-                  <Icon name="clock" className="size-3.5" /> Reported {timeAgo(item.submittedAt)}
+                  <Icon name="clock" className="size-3.5" />{" "}
+                  {hasActiveVisit(item) && item.visit ? `Visit ${fmtSlot(item.visit)}` : `Reported ${timeAgo(item.submittedAt)}`}
                 </span>
               </div>
             </button>
@@ -2441,7 +2766,7 @@ export default function App() {
     const byRole = role === "admin" ? "Administrator" : role === "maintenance" ? "Maintenance" : item.requester.role;
     const event: TimelineEvent = {
       kind: action,
-      title: eventTitle(action, next.assignee),
+      title: payload.title ?? eventTitle(action, next.assignee),
       status,
       at: Math.max(Date.now(), lastEvent(item).at + 1000),
       by: user,
@@ -2450,7 +2775,16 @@ export default function App() {
       reason: payload.reason,
       evidence: payload.evidence,
     };
-    setItems((prev) => prev.map((i) => (i.id === id ? { ...next, status, history: [...i.history, event] } : i)));
+    const extra: TimelineEvent[] = (payload.extra ?? []).map((e, n) => ({
+      kind: e.kind,
+      title: e.title,
+      status,
+      at: event.at + (n + 1) * 1000,
+      by: user,
+      byRole,
+      note: e.note,
+    }));
+    setItems((prev) => prev.map((i) => (i.id === id ? { ...next, status, history: [...i.history, event, ...extra] } : i)));
     return true;
   };
 
@@ -2471,7 +2805,7 @@ export default function App() {
       description: data.description,
       requester,
       priority: "Not set",
-      attachment: data.file ? { name: data.file.name, size: formatSize(data.file.size) } : undefined,
+      attachment: data.file ? { name: data.file.name, size: formatSize(data.file.size), previewUrl: data.previewUrl } : undefined,
       submittedAt: now,
       status: "Submitted",
       history: [
@@ -2496,7 +2830,7 @@ export default function App() {
     if (view === "confirmation") return <Confirmation item={selected} navigate={setView} onOpen={openComplaint} />;
     if (view === "complaints" && role !== "maintenance")
       return <ComplaintsList items={role === "admin" ? items : myComplaints} navigate={setView} onOpen={openComplaint} role={role} />;
-    if (view === "detail") return <ComplaintDetail act={act} item={selected} key={selected.id} navigate={setView} role={role} user={user} />;
+    if (view === "detail") return <ComplaintDetail act={act} item={selected} items={items} key={selected.id} navigate={setView} role={role} user={user} />;
     if (view === "assignments" && role === "maintenance") return <Assignments items={myAssignments} onOpen={openComplaint} />;
     if (view === "feedback" && role === "student") return <Feedback act={act} item={selected} key={selected.id} navigate={setView} />;
     if (role === "admin") return <AdminDashboard items={items} navigate={setView} onOpen={openComplaint} user={user} />;
