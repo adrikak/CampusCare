@@ -1,4 +1,16 @@
-import { useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { supabase, supabaseConfigError, supabaseProjectHost } from "./lib/supabase";
+import {
+  loadComplaintData,
+  loadMyProfile,
+  loadStaff,
+  performAction,
+  submitComplaintToDb,
+  type ComplaintRow,
+  type EventRow,
+  type ProfileRow,
+  type StaffRow,
+} from "./lib/data";
 
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
@@ -59,6 +71,9 @@ type Complaint = {
   location: string;
   description: string;
   requester: Requester;
+  /** Database ids (present for complaints loaded from Supabase). */
+  requesterId?: string;
+  assigneeId?: string;
   priority: Priority;
   team?: string;
   assignee?: string;
@@ -95,6 +110,9 @@ const categoryTeam: Record<string, string> = {
   HVAC: "General Maintenance",
   Other: "General Maintenance",
 };
+
+/** Maintenance staff loaded from the database (id, name, team). The assign lists use this, not the names above. */
+const StaffContext = createContext<StaffRow[]>([]);
 
 const categories = ["Electrical", "Plumbing", "IT & Network", "Furniture", "Cleanliness", "Safety", "HVAC", "Other"];
 const buildings = ["A1", "A2", "B", "C", "D"];
@@ -190,7 +208,15 @@ function latestResolution(item: Complaint): TimelineEvent | undefined {
 }
 
 const reopenCount = (item: Complaint) => item.history.filter((e) => e.kind === "reopened").length;
-const lastEvent = (item: Complaint) => item.history[item.history.length - 1];
+const lastEvent = (item: Complaint): TimelineEvent =>
+  item.history[item.history.length - 1] ?? {
+    kind: "submitted",
+    title: "Complaint submitted",
+    status: item.status,
+    at: item.submittedAt,
+    by: item.requester.name,
+    byRole: item.requester.role,
+  };
 
 /* ------------------------------------------------------------------ */
 /* Dates                                                               */
@@ -480,13 +506,87 @@ function buildSeed(seed: Seed): Complaint {
   return { ...rest, location: formatLocation(seed), submittedAt, status, history, visit };
 }
 
-const initialComplaints: Complaint[] = seeds.map(buildSeed).sort((a, b) => b.submittedAt - a.submittedAt);
+/* Phase 1: the built-in sample data above is no longer shown; complaints come
+   from Supabase. It is kept for now so this change is easy to undo. */
+export const prototypeSampleComplaints: Complaint[] = seeds.map(buildSeed).sort((a, b) => b.submittedAt - a.submittedAt);
+
+/** Converts database rows (column names from supabase/schema.sql) into the shape the UI already uses. */
+function toComplaints(rows: ComplaintRow[], events: EventRow[]): Complaint[] {
+  const byComplaint = new Map<string, TimelineEvent[]>();
+  for (const e of events) {
+    const list = byComplaint.get(e.complaint_id) ?? [];
+    list.push({
+      kind: e.kind as EventKind,
+      title: e.title,
+      status: e.status as Status,
+      at: Date.parse(e.at),
+      by: e.actor_name,
+      byRole: e.actor_role,
+      note: e.note ?? undefined,
+      reason: e.reason ?? undefined,
+      evidence: e.evidence_name ? { name: e.evidence_name, size: e.evidence_size != null ? formatSize(e.evidence_size) : "" } : undefined,
+    });
+    byComplaint.set(e.complaint_id, list);
+  }
+  return rows.map((r) => ({
+    id: r.id,
+    title: r.title,
+    category: r.category,
+    building: r.building,
+    floor: r.floor,
+    room: r.room,
+    location: formatLocation(r),
+    description: r.description,
+    requester: { name: r.requester_name, role: r.requester_role === "Faculty" ? "Faculty" : "Student" },
+    requesterId: r.requester_id,
+    assigneeId: r.assignee_id ?? undefined,
+    priority: r.priority as Priority,
+    team: r.team ?? undefined,
+    assignee: r.assignee_name ?? undefined,
+    attachment: r.attachment_name
+      ? { name: r.attachment_name, size: r.attachment_size != null ? formatSize(r.attachment_size) : "" }
+      : undefined,
+    visit:
+      r.visit_start && r.visit_end
+        ? { start: Date.parse(r.visit_start), end: Date.parse(r.visit_end), days: r.visit_days ?? 1 }
+        : undefined,
+    submittedAt: Date.parse(r.submitted_at),
+    status: r.status as Status,
+    history: byComplaint.get(r.id) ?? [],
+  }));
+}
+
+/** Fictional demo logins (created in Supabase). These only fill in the email box; the role always comes from the database. */
+const DEMO_ACCOUNTS: Array<{ label: string; name: string; email: string; icon: string }> = [
+  { label: "Student", name: "Ananya Kulkarni", email: "ananya.kulkarni@campuscare.demo", icon: "users" },
+  { label: "Student", name: "Rohan Deshpande", email: "rohan.deshpande@campuscare.demo", icon: "users" },
+  { label: "Faculty", name: "Prof. Meera Joshi", email: "meera.joshi@campuscare.demo", icon: "users" },
+  { label: "Administrator", name: "Sunita Patil", email: "sunita.patil@campuscare.demo", icon: "clipboard" },
+  ...staffDirectory.map((s) => ({
+    label: `Maintenance · ${s.team}`,
+    name: s.name,
+    email: `${s.name.toLowerCase().replace(/\s+/g, ".")}@campuscare.demo`,
+    icon: "wrench",
+  })),
+];
 
 /* ------------------------------------------------------------------ */
 /* Icons & small UI primitives (unchanged design)                      */
 /* ------------------------------------------------------------------ */
 
 const iconPaths: Record<string, ReactNode> = {
+  eye: (
+    <>
+      <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z" />
+      <circle cx="12" cy="12" r="3" />
+    </>
+  ),
+  eyeOff: (
+    <>
+      <path d="M10.6 5.1A10.4 10.4 0 0 1 12 5c6.5 0 10 7 10 7a17.6 17.6 0 0 1-3.2 4.2M6.6 6.6C3.7 8.5 2 12 2 12s3.5 7 10 7a9.7 9.7 0 0 0 5.4-1.6" />
+      <path d="M9.9 9.9a3 3 0 0 0 4.2 4.2M3 3l18 18" />
+    </>
+  ),
   logo: (
     <>
       <path d="M12 3 4 7v5c0 4.5 3.4 7.9 8 9 4.6-1.1 8-4.5 8-9V7l-8-4Z" />
@@ -686,6 +786,10 @@ function FieldError({ message }: { message?: string }) {
   );
 }
 
+function firstName(name: string) {
+  return name.replace(/^Prof\.\s*/, "").split(" ")[0];
+}
+
 function initials(name: string) {
   return name
     .replace(/^Prof\.\s*/, "")
@@ -851,16 +955,31 @@ function ReasonForm({
 /* Login                                                               */
 /* ------------------------------------------------------------------ */
 
-function Login({ onLogin }: { onLogin: (role: Role, user: string) => void }) {
-  const [role, setRole] = useState<Role>("student");
-  const [staff, setStaff] = useState("Ramesh Jadhav");
-  const roleOptions: Array<{ role: Role; title: string; copy: string; icon: string }> = [
-    { role: "student", title: "Student / Faculty", copy: `Demo user: ${STUDENT_USER.name}`, icon: "users" },
-    { role: "admin", title: "Administrator", copy: `Demo user: ${ADMIN_NAME} · Campus Services`, icon: "clipboard" },
-    { role: "maintenance", title: "Maintenance", copy: "Choose a demo staff member below", icon: "wrench" },
-  ];
-  const user = role === "student" ? STUDENT_USER.name : role === "admin" ? ADMIN_NAME : staff;
-  const demoEmail = `${user.toLowerCase().replace(/^prof\.\s*/, "").replace(/\s+/g, ".")}@campuscare.demo`;
+function Login() {
+  const [email, setEmail] = useState(DEMO_ACCOUNTS[0].email);
+  const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const quick = [DEMO_ACCOUNTS[0], DEMO_ACCOUNTS[2], DEMO_ACCOUNTS[3], DEMO_ACCOUNTS[4]];
+
+  const signIn = async (event: FormEvent) => {
+    event.preventDefault();
+    if (!supabase) return;
+    setBusy(true);
+    setError("");
+    const { error: authError } = await supabase.auth.signInWithPassword({ email: email.trim(), password });
+    setBusy(false);
+    if (authError) {
+      setError(
+        /invalid login/i.test(authError.message)
+          ? "Email or password is incorrect."
+          : `Could not sign in: ${authError.message}`,
+      );
+    }
+    // On success the auth listener in <App> loads the profile and complaints.
+  };
+
   return (
     <main className="grid min-h-screen bg-slate-50 dark:bg-slate-950 lg:grid-cols-[1.05fr_.95fr]">
       <style>{darkModeCss}</style>
@@ -892,7 +1011,7 @@ function Login({ onLogin }: { onLogin: (role: Role, user: string) => void }) {
             ))}
           </div>
         </div>
-        <p className="relative text-xs text-slate-500">CampusCare demonstration portal · Simulated data only · All names are fictional</p>
+        <p className="relative text-xs text-slate-500">CampusCare demonstration portal · Demo accounts and data are fictional</p>
       </section>
       <section className="flex items-center justify-center p-5 sm:p-10">
         <div className="w-full max-w-lg">
@@ -902,61 +1021,87 @@ function Login({ onLogin }: { onLogin: (role: Role, user: string) => void }) {
           <div className="mb-8">
             <p className="text-sm font-semibold text-blue-600 dark:text-blue-400">Welcome</p>
             <h2 className="mt-2 text-3xl font-bold tracking-tight text-slate-900 dark:text-slate-50">Sign in to CampusCare</h2>
-            <p className="mt-2 text-slate-500 dark:text-slate-400">Choose a demo role to explore the complete workflow.</p>
+            <p className="mt-2 text-slate-500 dark:text-slate-400">Use one of the demo accounts. Your role comes from your account.</p>
           </div>
-          <div className="space-y-3">
-            {roleOptions.map((item) => (
+          <p className="mb-2 text-xs font-bold uppercase tracking-widest text-slate-400 dark:text-slate-500">Demo accounts</p>
+          <div className="grid gap-3 sm:grid-cols-2">
+            {quick.map((item) => (
               <button
-                className={`flex w-full items-center gap-4 rounded-2xl border p-4 text-left transition ${
-                  role === item.role ? "border-blue-500 bg-blue-50 dark:bg-blue-500/10 ring-4 ring-blue-50 dark:ring-blue-500/20" : "border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 hover:border-slate-300 dark:hover:border-slate-600"
+                className={`flex w-full items-center gap-3 rounded-2xl border p-3 text-left transition ${
+                  email === item.email
+                    ? "border-blue-500 bg-blue-50 dark:bg-blue-500/10 ring-4 ring-blue-50 dark:ring-blue-500/20"
+                    : "border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 hover:border-slate-300 dark:hover:border-slate-600"
                 }`}
-                key={item.role}
-                onClick={() => setRole(item.role)}
+                key={item.email}
+                onClick={() => setEmail(item.email)}
+                type="button"
               >
                 <span
-                  className={`grid size-11 shrink-0 place-items-center rounded-xl ${
-                    role === item.role ? "bg-blue-600 text-white" : "bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300"
+                  className={`grid size-10 shrink-0 place-items-center rounded-xl ${
+                    email === item.email ? "bg-blue-600 text-white" : "bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300"
                   }`}
                 >
                   <Icon name={item.icon} />
                 </span>
                 <span className="min-w-0 flex-1">
-                  <span className="block font-semibold text-slate-900 dark:text-slate-50">{item.title}</span>
-                  <span className="mt-0.5 block text-sm text-slate-500 dark:text-slate-400">{item.copy}</span>
-                </span>
-                <span
-                  className={`grid size-5 place-items-center rounded-full border ${
-                    role === item.role ? "border-blue-600 bg-blue-600 text-white" : "border-slate-300 dark:border-slate-700"
-                  }`}
-                >
-                  {role === item.role && <Icon name="check" className="size-3" />}
+                  <span className="block truncate text-sm font-semibold text-slate-900 dark:text-slate-50">{item.label}</span>
+                  <span className="mt-0.5 block truncate text-xs text-slate-500 dark:text-slate-400">{item.name}</span>
                 </span>
               </button>
             ))}
           </div>
-          {role === "maintenance" && (
-            <div className="mt-4">
-              <Field label="Demo staff member">
-                <select className={fieldClass} onChange={(event) => setStaff(event.target.value)} value={staff}>
-                  {staffDirectory.map((s) => (
-                    <option key={s.name} value={s.name}>
-                      {s.name} · {s.team}
-                    </option>
-                  ))}
-                </select>
-              </Field>
-            </div>
-          )}
-          <div className="mt-4">
-            <Field label="Demo email">
-              <input className={`${fieldClass} bg-slate-50 dark:bg-slate-950 text-slate-500 dark:text-slate-400`} readOnly type="email" value={demoEmail} />
+          <form className="mt-5 space-y-4" noValidate onSubmit={signIn}>
+            <Field label="Email">
+              <input
+                autoComplete="username"
+                className={fieldClass}
+                list="campuscare-demo-accounts"
+                onChange={(event) => setEmail(event.target.value)}
+                type="email"
+                value={email}
+              />
+              <datalist id="campuscare-demo-accounts">
+                {DEMO_ACCOUNTS.map((a) => (
+                  <option key={a.email} value={a.email}>
+                    {a.name} · {a.label}
+                  </option>
+                ))}
+              </datalist>
             </Field>
-          </div>
-          <Button className="mt-6 w-full" onClick={() => onLogin(role, user)}>
-            Continue as {user} <Icon name="arrow" className="size-4" />
-          </Button>
-          <p className="mt-5 text-center text-xs leading-5 text-slate-400 dark:text-slate-500">
-            This is a simulated college demo. Sign-in and data are not connected to a live backend.
+            <Field label="Password">
+              <div className="relative">
+                <input
+                  autoComplete="current-password"
+                  className={`${fieldClass} pr-12`}
+                  onChange={(event) => setPassword(event.target.value)}
+                  type={showPassword ? "text" : "password"}
+                  value={password}
+                />
+                <button
+                  aria-label={showPassword ? "Hide password" : "Show password"}
+                  aria-pressed={showPassword}
+                  className="absolute inset-y-0 right-0 grid w-11 place-items-center rounded-r-xl text-slate-500 hover:text-slate-800 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-400 dark:hover:text-slate-100"
+                  onClick={(event) => {
+                    event.preventDefault();
+                    setShowPassword((v) => !v);
+                  }}
+                  title={showPassword ? "Hide password" : "Show password"}
+                  type="button"
+                >
+                  <Icon className="size-5" name={showPassword ? "eyeOff" : "eye"} />
+                </button>
+              </div>
+            </Field>
+            <FieldError message={error} />
+            <Button className="w-full" disabled={busy || !email.trim() || !password} type="submit">
+              {busy ? "Signing in…" : "Sign in"} {!busy && <Icon name="arrow" className="size-4" />}
+            </Button>
+          </form>
+          <p className="mt-5 text-center text-xs leading-5 text-slate-500 dark:text-slate-400">
+            Demo accounts are fictional. Other staff logins can be typed into the email box.
+          </p>
+          <p className="mt-2 text-center text-xs text-slate-500 dark:text-slate-400">
+            Live database: <span className="font-semibold">{supabaseProjectHost}</span>
           </p>
         </div>
       </section>
@@ -971,6 +1116,7 @@ function Login({ onLogin }: { onLogin: (role: Role, user: string) => void }) {
 function Sidebar({
   role,
   user,
+  roleLabel,
   view,
   setView,
   onLogout,
@@ -979,6 +1125,7 @@ function Sidebar({
 }: {
   role: Role;
   user: string;
+  roleLabel: string;
   view: View;
   setView: (view: View) => void;
   onLogout: () => void;
@@ -1002,12 +1149,6 @@ function Sidebar({
             ["assignments", "wrench", "My assignments"],
           ];
   const listView = role === "maintenance" ? "assignments" : "complaints";
-  const roleLabel =
-    role === "student"
-      ? STUDENT_USER.role
-      : role === "admin"
-        ? "Administrator"
-        : `Maintenance · ${staffDirectory.find((s) => s.name === user)?.team ?? ""}`;
   return (
     <>
       {open && (
@@ -1054,7 +1195,7 @@ function Sidebar({
             className="mt-3 flex w-full items-center gap-2 rounded-lg px-2 py-2 text-xs font-semibold text-slate-500 dark:text-slate-400 hover:bg-white dark:hover:bg-slate-800 hover:text-slate-900 dark:hover:text-white"
             onClick={onLogout}
           >
-            <Icon name="logout" className="size-4" /> Switch role
+            <Icon name="logout" className="size-4" /> Sign out
           </button>
         </div>
       </aside>
@@ -1074,7 +1215,7 @@ function AppHeader({ role, setOpen }: { role: Role; setOpen: (value: boolean) =>
       </button>
       <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-50 dark:bg-amber-500/10 px-2.5 py-1 text-xs font-semibold text-amber-800 dark:text-amber-200 ring-1 ring-inset ring-amber-200 dark:ring-amber-500/30">
         <span className="size-1.5 rounded-full bg-amber-500" />
-        Prototype · simulated data<span className="hidden sm:inline"> · resets on refresh</span>
+        Live data<span className="hidden sm:inline"> · changes are saved</span>
       </span>
       <span className="hidden text-sm font-semibold text-slate-700 dark:text-slate-200 sm:block">
         {role === "student" ? "JSPM RSCOE" : role === "admin" ? "Admin portal" : "Maintenance team"}
@@ -1228,7 +1369,7 @@ function StudentDashboard({
   const pending = items.filter((i) => ["Submitted", "Under Review", "Assigned"].includes(i.status)).length;
   const inProgress = items.filter((i) => i.status === "In Progress").length;
   const toConfirm = items.filter((i) => i.status === "Resolved").length;
-  const firstName = user.split(" ")[0];
+  const first = firstName(user);
   return (
     <>
       <PageTitle
@@ -1239,7 +1380,7 @@ function StudentDashboard({
         }
         copy="Here’s what’s happening with your campus requests."
         eyebrow={todayLabel()}
-        title={`${greeting()}, ${firstName}`}
+        title={`${greeting()}, ${first}`}
       />
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard color="bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400" icon="clipboard" label="My complaints" note="All reports you have submitted" value={items.length} />
@@ -1283,7 +1424,7 @@ function StudentDashboard({
             </p>
           </div>
           <p className="px-1 text-xs leading-5 text-slate-500 dark:text-slate-400">
-            CampusCare is a prototype. All complaints shown here are simulated and live only in this browser session.
+            CampusCare is a Design Thinking prototype. Complaints are saved in the project database; all people and data are fictional.
           </p>
         </aside>
       </div>
@@ -1512,8 +1653,8 @@ function ReportForm({ onSubmit }: { onSubmit: (data: NewComplaint) => void }) {
             </ol>
           </div>
           <p className="px-2 text-xs leading-5 text-slate-500 dark:text-slate-400">
-            Prototype notice: reports in this demo are stored only in the current browser session and are not sent to a real campus team. Files are not
-            uploaded anywhere.
+            Prototype notice: reports are saved in the CampusCare demo database and are not sent to a real campus team. Attached files are not
+            uploaded yet.
           </p>
         </aside>
       </div>
@@ -1683,7 +1824,7 @@ type ActFn = (
   id: string,
   action: Action,
   payload?: { note?: string; reason?: string; evidence?: Evidence; patch?: Partial<Complaint>; title?: string; extra?: ExtraEvent[] },
-) => boolean;
+) => Promise<boolean>;
 
 function Panel({ title, children }: { title: string; children: ReactNode }) {
   return (
@@ -1835,7 +1976,9 @@ function AssignFields({
   staff: string;
   setStaff: (v: string) => void;
 }) {
-  const members = staffDirectory.filter((s) => s.team === team);
+  const members = useContext(StaffContext)
+    .filter((s) => s.team === team)
+    .map((s) => ({ name: s.full_name }));
   return (
     <>
       <Field label="Team">
@@ -2436,7 +2579,7 @@ function AdminDashboard({ items, user, onOpen, navigate }: { items: Complaint[];
 
   return (
     <>
-      <PageTitle copy="Every number on this page is counted from the complaints below." eyebrow={todayLabel()} title={`${greeting()}, ${user.split(" ")[0]}`} />
+      <PageTitle copy="Every number on this page is counted from the complaints below." eyebrow={todayLabel()} title={`${greeting()}, ${firstName(user)}`} />
       <div className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
         <StatCard color="bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300" icon="clipboard" label="New — needs review" note={`${submitted.length} awaiting priority`} value={submitted.length} />
         <StatCard color="bg-amber-50 dark:bg-amber-500/10 text-amber-600 dark:text-amber-400" icon="clock" label="Under review" note="Priority set, awaiting assignment" value={review.length} />
@@ -2513,7 +2656,7 @@ function MaintenanceDashboard({ items, user, onOpen, navigate }: { items: Compla
   const active = items.filter((i) => i.status === "Assigned" || i.status === "In Progress");
   return (
     <>
-      <PageTitle copy="Your assigned service requests, most urgent first." eyebrow={todayLabel()} title={`${greeting()}, ${user.split(" ")[0]}`} />
+      <PageTitle copy="Your assigned service requests, most urgent first." eyebrow={todayLabel()} title={`${greeting()}, ${firstName(user)}`} />
       <div className="grid gap-4 sm:grid-cols-3">
         <StatCard color="bg-violet-50 dark:bg-violet-500/10 text-violet-600 dark:text-violet-400" icon="clipboard" label="Assigned to you" note="Not started yet" value={assigned} />
         <StatCard color="bg-blue-50 dark:bg-blue-500/10 text-blue-600 dark:text-blue-400" icon="wrench" label="In progress" note="Work started" value={inProgress} />
@@ -2662,7 +2805,7 @@ function Feedback({ item, navigate, act }: { item: Complaint; navigate: (view: V
               label="What is still wrong?"
               onCancel={() => setReopening(false)}
               onConfirm={(reason) => {
-                if (act(item.id, "reopened", { reason })) setDone("reopened");
+                void act(item.id, "reopened", { reason }).then((ok) => ok && setDone("reopened"));
               }}
               placeholder="e.g. The AC still is not cooling after 30 minutes."
               variant="danger"
@@ -2703,7 +2846,7 @@ function Feedback({ item, navigate, act }: { item: Complaint; navigate: (view: V
               <Button
                 onClick={() => {
                   const parts = [rating ? `Rated ${rating}/5.` : "", comment.trim() ? `“${comment.trim()}”` : ""].filter(Boolean);
-                  if (act(item.id, "confirmed", { note: parts.join(" ") || undefined })) setDone("closed");
+                  void act(item.id, "confirmed", { note: parts.join(" ") || undefined }).then((ok) => ok && setDone("closed"));
                 }}
               >
                 <Icon name="check" className="size-4" /> Confirm fixed
@@ -2726,116 +2869,240 @@ function Feedback({ item, navigate, act }: { item: Complaint; navigate: (view: V
 /* App                                                                 */
 /* ------------------------------------------------------------------ */
 
-export default function App() {
-  const [role, setRole] = useState<Role | null>(null);
-  const [user, setUser] = useState("");
-  const [view, setView] = useState<View>("login");
-  const [menuOpen, setMenuOpen] = useState(false);
-  const [items, setItems] = useState<Complaint[]>(initialComplaints);
-  const [selectedId, setSelectedId] = useState<string>(initialComplaints[0].id);
+/** Full-screen message used for loading, configuration and error states. */
+function StatusScreen({ title, message, action }: { title: string; message: string; action?: ReactNode }) {
+  return (
+    <main className="grid min-h-screen place-items-center bg-slate-50 dark:bg-slate-950 p-6 text-slate-900 dark:text-slate-50">
+      <style>{darkModeCss}</style>
+      <div className="w-full max-w-md rounded-3xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-8 text-center shadow-sm" role="status">
+        <div className="mx-auto mb-5 w-fit">
+          <Logo />
+        </div>
+        <h1 className="text-xl font-bold">{title}</h1>
+        <p className="mt-3 text-sm leading-6 text-slate-600 dark:text-slate-300">{message}</p>
+        {action && <div className="mt-6 flex flex-col justify-center gap-2 sm:flex-row">{action}</div>}
+      </div>
+    </main>
+  );
+}
 
-  if (!role || view === "login") {
+type AuthState = "checking" | "signedOut" | "signedIn";
+type LoadState = "loading" | "ready" | "error";
+
+export default function App() {
+  const [auth, setAuth] = useState<AuthState>("checking");
+  const [userId, setUserId] = useState<string | null>(null);
+  const [profile, setProfile] = useState<ProfileRow | null>(null);
+  const [load, setLoad] = useState<LoadState>("loading");
+  const [loadError, setLoadError] = useState("");
+  const [view, setView] = useState<View>("dashboard");
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [items, setItems] = useState<Complaint[]>([]);
+  const [selectedId, setSelectedId] = useState<string>("");
+  const [notice, setNotice] = useState("");
+  const [noticeTone, setNoticeTone] = useState<"info" | "error">("info");
+  const [staff, setStaff] = useState<StaffRow[]>([]);
+  const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
+
+  // Keep the session (it survives a page refresh) and react to sign-in / sign-out.
+  useEffect(() => {
+    if (!supabase) return;
+    let active = true;
+    supabase.auth.getSession().then(({ data }) => {
+      if (!active) return;
+      setUserId(data.session?.user.id ?? null);
+      setAuth(data.session ? "signedIn" : "signedOut");
+    });
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, session) => {
+      setUserId(session?.user.id ?? null);
+      setAuth(session ? "signedIn" : "signedOut");
+    });
+    return () => {
+      active = false;
+      listener.subscription.unsubscribe();
+    };
+  }, []);
+
+  // Load the profile (role and team) and the complaints this user may see.
+  const reload = useCallback(async () => {
+    if (!userId) return;
+    setLoad("loading");
+    setLoadError("");
+    try {
+      const me = await loadMyProfile(userId);
+      const [data, staffRows] = await Promise.all([loadComplaintData(), loadStaff()]);
+      setProfile(me);
+      setStaff(staffRows);
+      setItems(toComplaints(data.complaints, data.events));
+      setLoad("ready");
+      // Safe diagnostics: no passwords, tokens or keys.
+      console.info(
+        `[CampusCare] ${supabaseProjectHost} · signed in as ${me.email} (${me.role}${me.team ? `, ${me.team}` : ""}) · ` +
+          `${data.complaints.length} complaint(s), ${data.events.length} timeline event(s): ${data.complaints.map((c) => c.id).join(", ") || "none"}`,
+      );
+    } catch (err) {
+      console.error("[CampusCare] Loading failed:", err instanceof Error ? err.message : err);
+      setLoadError(err instanceof Error ? err.message : "Something went wrong while loading.");
+      setLoad("error");
+    }
+  }, [userId]);
+
+  useEffect(() => {
+    if (auth === "signedIn" && userId) {
+      setView("dashboard");
+      setMenuOpen(false);
+      void reload();
+    } else {
+      setProfile(null);
+      setItems([]);
+      setSelectedId("");
+      setNotice("");
+    }
+  }, [auth, userId, reload]);
+
+  const signOut = async () => {
+    setMenuOpen(false);
+    await supabase?.auth.signOut();
+  };
+
+  if (supabaseConfigError) {
+    return <StatusScreen message={supabaseConfigError} title="CampusCare is not connected yet" />;
+  }
+  if (auth === "checking") return <StatusScreen message="Checking your sign-in…" title="Loading" />;
+  if (auth === "signedOut") return <Login />;
+  if (load === "loading" && !profile) return <StatusScreen message="Loading your complaints…" title="Loading" />;
+  if (load === "error" || !profile) {
     return (
-      <Login
-        onLogin={(selectedRole, name) => {
-          setRole(selectedRole);
-          setUser(name);
-          setView("dashboard");
-        }}
+      <StatusScreen
+        action={
+          <>
+            <Button onClick={() => void reload()}>Try again</Button>
+            <Button onClick={() => void signOut()} variant="secondary">
+              Sign out
+            </Button>
+          </>
+        }
+        message={loadError || "Your profile could not be loaded."}
+        title="Couldn't load CampusCare"
       />
     );
   }
 
-  const selected = items.find((item) => item.id === selectedId) ?? items[0];
-  const myComplaints = items.filter((i) => i.requester.name === user);
-  const myAssignments = items
-    .filter((i) => i.assignee === user && i.status !== "Closed")
-    .sort((a, b) => priorityRank[a.priority] - priorityRank[b.priority] || a.submittedAt - b.submittedAt);
+  // Role and team come from the database profile, never from the login screen.
+  const role: Role = profile.role === "admin" ? "admin" : profile.role === "maintenance" ? "maintenance" : "student";
+  const user = profile.full_name;
+  const roleLabel =
+    profile.role === "admin"
+      ? "Administrator"
+      : profile.role === "maintenance"
+        ? `Maintenance · ${profile.team ?? ""}`
+        : profile.role === "faculty"
+          ? "Faculty"
+          : "Student";
+
+  const selected = items.find((item) => item.id === selectedId);
+  // The database already returns only rows this user may see; these filters just pick the right list for each screen.
+  const myComplaints = items.filter((i) => i.requesterId === profile.id);
+  const myActive = items.filter((i) => i.assigneeId === profile.id && i.status !== "Closed");
+  const myAssignments = [...myActive].sort((a, b) => priorityRank[a.priority] - priorityRank[b.priority] || a.submittedAt - b.submittedAt);
 
   const openComplaint = (id: string) => {
     setSelectedId(id);
     setView("detail");
   };
 
-  /** The only way a complaint's status can change. Rejects anything the rules do not allow. */
-  const act: ActFn = (id, action, payload = {}) => {
-    const item = items.find((i) => i.id === id);
-    if (!item || !canAct(item, action, role, user)) return false;
-    const next: Complaint = { ...item, ...payload.patch };
-    const status = resultStatus[action] ?? item.status;
-    const byRole = role === "admin" ? "Administrator" : role === "maintenance" ? "Maintenance" : item.requester.role;
-    const event: TimelineEvent = {
-      kind: action,
-      title: payload.title ?? eventTitle(action, next.assignee),
-      status,
-      at: Math.max(Date.now(), lastEvent(item).at + 1000),
-      by: user,
-      byRole,
-      note: payload.note,
-      reason: payload.reason,
-      evidence: payload.evidence,
-    };
-    const extra: TimelineEvent[] = (payload.extra ?? []).map((e, n) => ({
-      kind: e.kind,
-      title: e.title,
-      status,
-      at: event.at + (n + 1) * 1000,
-      by: user,
-      byRole,
-      note: e.note,
-    }));
-    setItems((prev) => prev.map((i) => (i.id === id ? { ...next, status, history: [...i.history, event, ...extra] } : i)));
-    return true;
+  const showNotice = (text: string, tone: "info" | "error") => {
+    setNotice(text);
+    setNoticeTone(tone);
+    window.scrollTo({ top: 0, behavior: "smooth" });
+  };
+  const FILE_NOT_UPLOADED = "Saved. The attached file was not uploaded: file uploads are switched on in the next step.";
+
+  /** Saves one lifecycle step through the database function perform_action, then reloads from the database. */
+  const act: ActFn = async (id, action, payload = {}) => {
+    if (savingRef.current) return false;
+    const patch = payload.patch ?? {};
+    const visitParams = (v?: Visit) =>
+      v ? { visit_start: new Date(v.start).toISOString(), visit_hours: Math.round((v.end - v.start) / 3_600_000), visit_days: v.days ?? 1 } : {};
+    const p: Record<string, unknown> = {};
+    if (action === "reviewStarted") p.priority = patch.priority;
+    else if (action === "assigned" || action === "reassigned") {
+      const member = staff.find((s) => s.full_name === patch.assignee);
+      if (!member) {
+        showNotice("That staff member was not found in the database. Refresh the page and try again.", "error");
+        return false;
+      }
+      p.assignee = member.id;
+      if (action === "assigned") Object.assign(p, visitParams(patch.visit));
+    } else if (action === "visitScheduled") Object.assign(p, visitParams(patch.visit));
+    else if (action === "resolutionSubmitted" || action === "confirmed") {
+      if (payload.note) p.note = payload.note;
+    } else if (payload.reason) p.reason = payload.reason;
+
+    savingRef.current = true;
+    setSaving(true);
+    try {
+      await performAction(id, action, p);
+      console.info(`[CampusCare] saved ${action} on ${id}`);
+      await reload();
+      if (action === "resolutionSubmitted" && payload.evidence) showNotice(FILE_NOT_UPLOADED, "info");
+      else setNotice("");
+      return true;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "The change could not be saved.";
+      console.error(`[CampusCare] ${action} on ${id} failed:`, message);
+      showNotice(`Not saved: ${message}`, "error");
+      return false;
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
   };
 
-  const submitComplaint = (data: NewComplaint) => {
-    const numbers = items.map((i) => Number(i.id.split("-")[2]) || 0);
-    const id = `CC-${new Date().getFullYear()}-${String(Math.max(0, ...numbers) + 1).padStart(4, "0")}`;
-    const title = data.description.length > 56 ? `${data.description.slice(0, 56).trim()}…` : data.description;
-    const requester = STUDENT_USER;
-    const now = Date.now();
-    const created: Complaint = {
-      id,
-      title,
-      category: data.category,
-      building: data.building,
-      floor: data.floor,
-      room: data.room,
-      location: formatLocation(data),
-      description: data.description,
-      requester,
-      priority: "Not set",
-      attachment: data.file ? { name: data.file.name, size: formatSize(data.file.size), previewUrl: data.previewUrl } : undefined,
-      submittedAt: now,
-      status: "Submitted",
-      history: [
-        {
-          kind: "submitted",
-          title: eventTitle("submitted"),
-          status: "Submitted",
-          at: now,
-          by: requester.name,
-          byRole: requester.role,
-          note: data.file ? "Submitted with evidence attached." : undefined,
-        },
-      ],
-    };
-    setItems((prev) => [created, ...prev]);
-    setSelectedId(id);
-    setView("confirmation");
+  /** Saves a new complaint through the database function submit_complaint. */
+  const submitComplaint = async (data: NewComplaint) => {
+    if (savingRef.current) return;
+    savingRef.current = true;
+    setSaving(true);
+    try {
+      const newId = await submitComplaintToDb({
+        category: data.category,
+        building: data.building,
+        floor: data.floor,
+        room: data.room,
+        description: data.description,
+      });
+      console.info(`[CampusCare] submitted ${newId}`);
+      await reload();
+      setSelectedId(newId);
+      setView("confirmation");
+      if (data.file) showNotice(FILE_NOT_UPLOADED, "info");
+      else setNotice("");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "The complaint could not be saved.";
+      console.error("[CampusCare] submit failed:", message);
+      showNotice(`Not saved: ${message}`, "error");
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
   };
 
   const renderView = () => {
+    if ((view === "detail" || view === "feedback" || view === "confirmation") && !selected) {
+      return <EmptyState copy="It may have been removed, or you may not have access to it." title="Complaint not found" />;
+    }
     if (role === "student" && view === "report") return <ReportForm onSubmit={submitComplaint} />;
-    if (view === "confirmation") return <Confirmation item={selected} navigate={setView} onOpen={openComplaint} />;
+    if (view === "confirmation" && selected) return <Confirmation item={selected} navigate={setView} onOpen={openComplaint} />;
     if (view === "complaints" && role !== "maintenance")
       return <ComplaintsList items={role === "admin" ? items : myComplaints} navigate={setView} onOpen={openComplaint} role={role} />;
-    if (view === "detail") return <ComplaintDetail act={act} item={selected} items={items} key={selected.id} navigate={setView} role={role} user={user} />;
+    if (view === "detail" && selected)
+      return <ComplaintDetail act={act} item={selected} items={items} key={selected.id} navigate={setView} role={role} user={user} />;
     if (view === "assignments" && role === "maintenance") return <Assignments items={myAssignments} onOpen={openComplaint} />;
-    if (view === "feedback" && role === "student") return <Feedback act={act} item={selected} key={selected.id} navigate={setView} />;
+    if (view === "feedback" && role === "student" && selected) return <Feedback act={act} item={selected} key={selected.id} navigate={setView} />;
     if (role === "admin") return <AdminDashboard items={items} navigate={setView} onOpen={openComplaint} user={user} />;
-    if (role === "maintenance")
-      return <MaintenanceDashboard items={items.filter((i) => i.assignee === user && i.status !== "Closed")} navigate={setView} onOpen={openComplaint} user={user} />;
+    if (role === "maintenance") return <MaintenanceDashboard items={myActive} navigate={setView} onOpen={openComplaint} user={user} />;
     return <StudentDashboard items={myComplaints} navigate={setView} onOpen={openComplaint} user={user} />;
   };
 
@@ -2843,22 +3110,43 @@ export default function App() {
     <div className="min-h-screen bg-slate-50 dark:bg-slate-950 text-slate-900 dark:text-slate-50">
       <style>{darkModeCss}</style>
       <Sidebar
-        onLogout={() => {
-          setMenuOpen(false);
-          setRole(null);
-          setUser("");
-          setView("login");
-        }}
+        onLogout={() => void signOut()}
         open={menuOpen}
         role={role}
+        roleLabel={roleLabel}
         setOpen={setMenuOpen}
-        setView={setView}
+        setView={(v) => {
+          setNotice("");
+          setView(v);
+        }}
         user={user}
         view={view}
       />
       <div className="lg:pl-64">
         <AppHeader role={role} setOpen={setMenuOpen} />
-        <main className="mx-auto max-w-screen-2xl p-4 sm:p-8">{renderView()}</main>
+        <main className="mx-auto max-w-screen-2xl p-4 sm:p-8">
+          {notice && (
+            <div
+              className={`mb-6 flex items-start justify-between gap-3 rounded-2xl border p-4 text-sm ${
+                noticeTone === "error"
+                  ? "border-red-200 dark:border-red-500/30 bg-red-50 dark:bg-red-500/10 text-red-800 dark:text-red-100"
+                  : "border-amber-200 dark:border-amber-500/30 bg-amber-50 dark:bg-amber-500/10 text-amber-900 dark:text-amber-100"
+              }`}
+              role="alert"
+            >
+              <p>{notice}</p>
+              <button aria-label="Dismiss" className="shrink-0 font-semibold underline" onClick={() => setNotice("")} type="button">
+                Dismiss
+              </button>
+            </div>
+          )}
+          {(saving || load === "loading") && (
+            <p className="mb-4 text-xs font-medium text-slate-500 dark:text-slate-400" role="status">
+              {saving ? "Saving…" : "Refreshing…"}
+            </p>
+          )}
+          <StaffContext.Provider value={staff}>{renderView()}</StaffContext.Provider>
+        </main>
       </div>
     </div>
   );

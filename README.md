@@ -26,45 +26,63 @@ Campus infrastructure complaints may be communicated through fragmented channels
 
 - **Frontend:** React, TypeScript, Vite
 - **Styling:** Tailwind CSS
+- **Backend and Database:** Supabase (PostgreSQL, Auth, Storage)
 - **Version Control:** Git and GitHub
-- **Backend and Database:** Planned
 
 ## 🚧 Project Status
 
-Currently under development. The initial frontend prototype has been added to the repository. Authentication, database operations, file storage, and other backend-dependent features are not yet confirmed as implemented.
+| Area | Status |
+|---|---|
+| Sign-in with Supabase Auth (demo accounts; role comes from the database) | Working |
+| Role-based views for students/faculty, admin and maintenance | Working |
+| Submitting complaints and every lifecycle step (review, assign, visit scheduling, work, resolution, confirm, reopen, close, reject) | Working, saved in the database |
+| Row-level security and server-side lifecycle rules | Working |
+| Evidence uploads (photos and PDFs) | Not yet. Files can be picked but are not uploaded. |
+| Deployment | Not yet |
+
+All people and complaints in the demo database are fictional.
+
+## 🔐 How data is protected
+
+- The browser uses only the Supabase **publishable/anon** key. The secret key is never used by the app or stored in this repository.
+- Row-level security lets each user read only what they should: students and faculty see their own complaints, maintenance staff see their assignments, administrators see everything.
+- The app cannot write to tables directly. Every change goes through two database functions (`submit_complaint`, `perform_action`) that check the user's role, the complaint's status and visit clashes before saving.
 
 ## ▶️ Running Locally
 
-Requirements: Node.js and pnpm.
+Requirements: Node.js 18+ and a Supabase project set up with [`supabase/SETUP.md`](supabase/SETUP.md).
 
-1. Clone the repository:
+1. Clone and install:
 
    ```bash
    git clone https://github.com/adrikak/CampusCare.git
    cd CampusCare
+   npm install
    ```
 
-2. Install dependencies:
-
-   ```bash
-   pnpm install
-   ```
+2. Copy `.env.example` to `.env.local` and fill in your Project URL and publishable key. `.env.local` is ignored by git.
 
 3. Start the development server:
 
    ```bash
-   pnpm dev
+   npm run dev
    ```
 
-Follow the local URL printed in the terminal.
+Open the local URL printed in the terminal and sign in with one of the demo accounts created during setup.
 
-## 🧭 Planned Development
+## 📁 Repository layout
 
-1. Complete the student, administrator, and maintenance interfaces.
-2. Implement complaint submission and tracking.
-3. Design the database and backend APIs.
-4. Integrate evidence uploads and role-based authorization.
-5. Test the end-to-end complaint lifecycle.
+- `src/`: the web app (`App.tsx`, plus `lib/` for the Supabase connection and data access)
+- `supabase/schema.sql`: tables, lifecycle rules, row-level security and storage rules
+- `supabase/seed.sql`: nine fictional sample complaints for the demo accounts
+- `supabase/SETUP.md`: step-by-step database setup
+- `scripts/create-demo-users.mjs`: optional script to create the demo logins (run locally; reads the secret key from an environment variable, never from a file)
+
+## 🧭 Next Steps
+
+1. Evidence uploads to Supabase Storage.
+2. Deployment.
+3. Usability testing and final report.
 
 ## 👩‍💻 Project
 
