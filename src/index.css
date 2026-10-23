@@ -34,3 +34,15 @@ select {
 ::selection {
   @apply bg-blue-200 text-slate-900;
 }
+
+/* Phone layout safety: grid and flex children may shrink below their content, and long
+   words, file names or IDs wrap or are shortened instead of making the page wider than
+   the screen (which made mobile browsers zoom the whole page out). */
+.grid > *,
+.flex > :not(svg, img, .shrink-0) {
+  min-width: 0;
+}
+
+main :where(p, h1, h2, h3, li, dd, dt, td, label, span, a) {
+  overflow-wrap: anywhere;
+}

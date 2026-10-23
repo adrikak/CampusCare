@@ -1,16 +1,6 @@
-import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
-import { supabase, supabaseConfigError, supabaseProjectHost } from "./lib/supabase";
-import {
-  loadComplaintData,
-  loadMyProfile,
-  loadStaff,
-  performAction,
-  submitComplaintToDb,
-  type ComplaintRow,
-  type EventRow,
-  type ProfileRow,
-  type StaffRow,
-} from "./lib/data";
+import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { supabase, supabaseConfigError } from "./lib/supabase";
+import { loadComplaintData, loadMyProfile, type ComplaintRow, type EventRow, type ProfileRow } from "./lib/data";
 
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
@@ -110,9 +100,6 @@ const categoryTeam: Record<string, string> = {
   HVAC: "General Maintenance",
   Other: "General Maintenance",
 };
-
-/** Maintenance staff loaded from the database (id, name, team). The assign lists use this, not the names above. */
-const StaffContext = createContext<StaffRow[]>([]);
 
 const categories = ["Electrical", "Plumbing", "IT & Network", "Furniture", "Cleanliness", "Safety", "HVAC", "Other"];
 const buildings = ["A1", "A2", "B", "C", "D"];
@@ -575,18 +562,6 @@ const DEMO_ACCOUNTS: Array<{ label: string; name: string; email: string; icon: s
 /* ------------------------------------------------------------------ */
 
 const iconPaths: Record<string, ReactNode> = {
-  eye: (
-    <>
-      <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z" />
-      <circle cx="12" cy="12" r="3" />
-    </>
-  ),
-  eyeOff: (
-    <>
-      <path d="M10.6 5.1A10.4 10.4 0 0 1 12 5c6.5 0 10 7 10 7a17.6 17.6 0 0 1-3.2 4.2M6.6 6.6C3.7 8.5 2 12 2 12s3.5 7 10 7a9.7 9.7 0 0 0 5.4-1.6" />
-      <path d="M9.9 9.9a3 3 0 0 0 4.2 4.2M3 3l18 18" />
-    </>
-  ),
   logo: (
     <>
       <path d="M12 3 4 7v5c0 4.5 3.4 7.9 8 9 4.6-1.1 8-4.5 8-9V7l-8-4Z" />
@@ -958,7 +933,6 @@ function ReasonForm({
 function Login() {
   const [email, setEmail] = useState(DEMO_ACCOUNTS[0].email);
   const [password, setPassword] = useState("");
-  const [showPassword, setShowPassword] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const quick = [DEMO_ACCOUNTS[0], DEMO_ACCOUNTS[2], DEMO_ACCOUNTS[3], DEMO_ACCOUNTS[4]];
@@ -1069,28 +1043,13 @@ function Login() {
               </datalist>
             </Field>
             <Field label="Password">
-              <div className="relative">
-                <input
-                  autoComplete="current-password"
-                  className={`${fieldClass} pr-12`}
-                  onChange={(event) => setPassword(event.target.value)}
-                  type={showPassword ? "text" : "password"}
-                  value={password}
-                />
-                <button
-                  aria-label={showPassword ? "Hide password" : "Show password"}
-                  aria-pressed={showPassword}
-                  className="absolute inset-y-0 right-0 grid w-11 place-items-center rounded-r-xl text-slate-500 hover:text-slate-800 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-400 dark:hover:text-slate-100"
-                  onClick={(event) => {
-                    event.preventDefault();
-                    setShowPassword((v) => !v);
-                  }}
-                  title={showPassword ? "Hide password" : "Show password"}
-                  type="button"
-                >
-                  <Icon className="size-5" name={showPassword ? "eyeOff" : "eye"} />
-                </button>
-              </div>
+              <input
+                autoComplete="current-password"
+                className={fieldClass}
+                onChange={(event) => setPassword(event.target.value)}
+                type="password"
+                value={password}
+              />
             </Field>
             <FieldError message={error} />
             <Button className="w-full" disabled={busy || !email.trim() || !password} type="submit">
@@ -1099,9 +1058,6 @@ function Login() {
           </form>
           <p className="mt-5 text-center text-xs leading-5 text-slate-500 dark:text-slate-400">
             Demo accounts are fictional. Other staff logins can be typed into the email box.
-          </p>
-          <p className="mt-2 text-center text-xs text-slate-500 dark:text-slate-400">
-            Live database: <span className="font-semibold">{supabaseProjectHost}</span>
           </p>
         </div>
       </section>
@@ -1215,7 +1171,7 @@ function AppHeader({ role, setOpen }: { role: Role; setOpen: (value: boolean) =>
       </button>
       <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-50 dark:bg-amber-500/10 px-2.5 py-1 text-xs font-semibold text-amber-800 dark:text-amber-200 ring-1 ring-inset ring-amber-200 dark:ring-amber-500/30">
         <span className="size-1.5 rounded-full bg-amber-500" />
-        Live data<span className="hidden sm:inline"> · changes are saved</span>
+        Live data<span className="hidden sm:inline"> · saving not switched on yet</span>
       </span>
       <span className="hidden text-sm font-semibold text-slate-700 dark:text-slate-200 sm:block">
         {role === "student" ? "JSPM RSCOE" : role === "admin" ? "Admin portal" : "Maintenance team"}
@@ -1424,7 +1380,7 @@ function StudentDashboard({
             </p>
           </div>
           <p className="px-1 text-xs leading-5 text-slate-500 dark:text-slate-400">
-            CampusCare is a Design Thinking prototype. Complaints are saved in the project database; all people and data are fictional.
+            CampusCare is a prototype. All complaints shown here are simulated and live only in this browser session.
           </p>
         </aside>
       </div>
@@ -1653,8 +1609,8 @@ function ReportForm({ onSubmit }: { onSubmit: (data: NewComplaint) => void }) {
             </ol>
           </div>
           <p className="px-2 text-xs leading-5 text-slate-500 dark:text-slate-400">
-            Prototype notice: reports are saved in the CampusCare demo database and are not sent to a real campus team. Attached files are not
-            uploaded yet.
+            Prototype notice: reports in this demo are stored only in the current browser session and are not sent to a real campus team. Files are not
+            uploaded anywhere.
           </p>
         </aside>
       </div>
@@ -1824,7 +1780,7 @@ type ActFn = (
   id: string,
   action: Action,
   payload?: { note?: string; reason?: string; evidence?: Evidence; patch?: Partial<Complaint>; title?: string; extra?: ExtraEvent[] },
-) => Promise<boolean>;
+) => boolean;
 
 function Panel({ title, children }: { title: string; children: ReactNode }) {
   return (
@@ -1976,9 +1932,7 @@ function AssignFields({
   staff: string;
   setStaff: (v: string) => void;
 }) {
-  const members = useContext(StaffContext)
-    .filter((s) => s.team === team)
-    .map((s) => ({ name: s.full_name }));
+  const members = staffDirectory.filter((s) => s.team === team);
   return (
     <>
       <Field label="Team">
@@ -2805,7 +2759,7 @@ function Feedback({ item, navigate, act }: { item: Complaint; navigate: (view: V
               label="What is still wrong?"
               onCancel={() => setReopening(false)}
               onConfirm={(reason) => {
-                void act(item.id, "reopened", { reason }).then((ok) => ok && setDone("reopened"));
+                if (act(item.id, "reopened", { reason })) setDone("reopened");
               }}
               placeholder="e.g. The AC still is not cooling after 30 minutes."
               variant="danger"
@@ -2846,7 +2800,7 @@ function Feedback({ item, navigate, act }: { item: Complaint; navigate: (view: V
               <Button
                 onClick={() => {
                   const parts = [rating ? `Rated ${rating}/5.` : "", comment.trim() ? `“${comment.trim()}”` : ""].filter(Boolean);
-                  void act(item.id, "confirmed", { note: parts.join(" ") || undefined }).then((ok) => ok && setDone("closed"));
+                  if (act(item.id, "confirmed", { note: parts.join(" ") || undefined })) setDone("closed");
                 }}
               >
                 <Icon name="check" className="size-4" /> Confirm fixed
@@ -2900,10 +2854,6 @@ export default function App() {
   const [items, setItems] = useState<Complaint[]>([]);
   const [selectedId, setSelectedId] = useState<string>("");
   const [notice, setNotice] = useState("");
-  const [noticeTone, setNoticeTone] = useState<"info" | "error">("info");
-  const [staff, setStaff] = useState<StaffRow[]>([]);
-  const [saving, setSaving] = useState(false);
-  const savingRef = useRef(false);
 
   // Keep the session (it survives a page refresh) and react to sign-in / sign-out.
   useEffect(() => {
@@ -2931,18 +2881,11 @@ export default function App() {
     setLoadError("");
     try {
       const me = await loadMyProfile(userId);
-      const [data, staffRows] = await Promise.all([loadComplaintData(), loadStaff()]);
+      const data = await loadComplaintData();
       setProfile(me);
-      setStaff(staffRows);
       setItems(toComplaints(data.complaints, data.events));
       setLoad("ready");
-      // Safe diagnostics: no passwords, tokens or keys.
-      console.info(
-        `[CampusCare] ${supabaseProjectHost} · signed in as ${me.email} (${me.role}${me.team ? `, ${me.team}` : ""}) · ` +
-          `${data.complaints.length} complaint(s), ${data.events.length} timeline event(s): ${data.complaints.map((c) => c.id).join(", ") || "none"}`,
-      );
     } catch (err) {
-      console.error("[CampusCare] Loading failed:", err instanceof Error ? err.message : err);
       setLoadError(err instanceof Error ? err.message : "Something went wrong while loading.");
       setLoad("error");
     }
@@ -3012,81 +2955,16 @@ export default function App() {
     setView("detail");
   };
 
-  const showNotice = (text: string, tone: "info" | "error") => {
-    setNotice(text);
-    setNoticeTone(tone);
+  // Phase 1 is read-only: nothing is saved yet, so actions explain that instead of pretending to work.
+  const READ_ONLY_NOTICE = "Saving changes is not switched on yet. This version only shows live data from the database.";
+  const act: ActFn = () => {
+    setNotice(READ_ONLY_NOTICE);
     window.scrollTo({ top: 0, behavior: "smooth" });
+    return false;
   };
-  const FILE_NOT_UPLOADED = "Saved. The attached file was not uploaded: file uploads are switched on in the next step.";
-
-  /** Saves one lifecycle step through the database function perform_action, then reloads from the database. */
-  const act: ActFn = async (id, action, payload = {}) => {
-    if (savingRef.current) return false;
-    const patch = payload.patch ?? {};
-    const visitParams = (v?: Visit) =>
-      v ? { visit_start: new Date(v.start).toISOString(), visit_hours: Math.round((v.end - v.start) / 3_600_000), visit_days: v.days ?? 1 } : {};
-    const p: Record<string, unknown> = {};
-    if (action === "reviewStarted") p.priority = patch.priority;
-    else if (action === "assigned" || action === "reassigned") {
-      const member = staff.find((s) => s.full_name === patch.assignee);
-      if (!member) {
-        showNotice("That staff member was not found in the database. Refresh the page and try again.", "error");
-        return false;
-      }
-      p.assignee = member.id;
-      if (action === "assigned") Object.assign(p, visitParams(patch.visit));
-    } else if (action === "visitScheduled") Object.assign(p, visitParams(patch.visit));
-    else if (action === "resolutionSubmitted" || action === "confirmed") {
-      if (payload.note) p.note = payload.note;
-    } else if (payload.reason) p.reason = payload.reason;
-
-    savingRef.current = true;
-    setSaving(true);
-    try {
-      await performAction(id, action, p);
-      console.info(`[CampusCare] saved ${action} on ${id}`);
-      await reload();
-      if (action === "resolutionSubmitted" && payload.evidence) showNotice(FILE_NOT_UPLOADED, "info");
-      else setNotice("");
-      return true;
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "The change could not be saved.";
-      console.error(`[CampusCare] ${action} on ${id} failed:`, message);
-      showNotice(`Not saved: ${message}`, "error");
-      return false;
-    } finally {
-      savingRef.current = false;
-      setSaving(false);
-    }
-  };
-
-  /** Saves a new complaint through the database function submit_complaint. */
-  const submitComplaint = async (data: NewComplaint) => {
-    if (savingRef.current) return;
-    savingRef.current = true;
-    setSaving(true);
-    try {
-      const newId = await submitComplaintToDb({
-        category: data.category,
-        building: data.building,
-        floor: data.floor,
-        room: data.room,
-        description: data.description,
-      });
-      console.info(`[CampusCare] submitted ${newId}`);
-      await reload();
-      setSelectedId(newId);
-      setView("confirmation");
-      if (data.file) showNotice(FILE_NOT_UPLOADED, "info");
-      else setNotice("");
-    } catch (err) {
-      const message = err instanceof Error ? err.message : "The complaint could not be saved.";
-      console.error("[CampusCare] submit failed:", message);
-      showNotice(`Not saved: ${message}`, "error");
-    } finally {
-      savingRef.current = false;
-      setSaving(false);
-    }
+  const submitComplaint = (_data: NewComplaint) => {
+    setNotice(READ_ONLY_NOTICE);
+    window.scrollTo({ top: 0, behavior: "smooth" });
   };
 
   const renderView = () => {
@@ -3127,11 +3005,7 @@ export default function App() {
         <main className="mx-auto max-w-screen-2xl p-4 sm:p-8">
           {notice && (
             <div
-              className={`mb-6 flex items-start justify-between gap-3 rounded-2xl border p-4 text-sm ${
-                noticeTone === "error"
-                  ? "border-red-200 dark:border-red-500/30 bg-red-50 dark:bg-red-500/10 text-red-800 dark:text-red-100"
-                  : "border-amber-200 dark:border-amber-500/30 bg-amber-50 dark:bg-amber-500/10 text-amber-900 dark:text-amber-100"
-              }`}
+              className="mb-6 flex items-start justify-between gap-3 rounded-2xl border border-amber-200 dark:border-amber-500/30 bg-amber-50 dark:bg-amber-500/10 p-4 text-sm text-amber-900 dark:text-amber-100"
               role="alert"
             >
               <p>{notice}</p>
@@ -3140,12 +3014,12 @@ export default function App() {
               </button>
             </div>
           )}
-          {(saving || load === "loading") && (
+          {load === "loading" && (
             <p className="mb-4 text-xs font-medium text-slate-500 dark:text-slate-400" role="status">
-              {saving ? "Saving…" : "Refreshing…"}
+              Refreshing…
             </p>
           )}
-          <StaffContext.Provider value={staff}>{renderView()}</StaffContext.Provider>
+          {renderView()}
         </main>
       </div>
     </div>
