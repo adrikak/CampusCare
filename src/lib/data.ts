@@ -113,7 +113,17 @@ function cleanError(error: { message?: string } | null): string {
   return msg || "The change could not be saved. Please try again.";
 }
 
-export type NewComplaintInput = { category: string; building: string; floor: string; room: string; description: string };
+export type NewComplaintInput = {
+  category: string;
+  building: string;
+  floor: string;
+  room: string;
+  description: string;
+  attachment_path?: string;
+  attachment_thumb?: string | null;
+  attachment_name?: string;
+  attachment_size?: number;
+};
 
 /** Students and faculty: creates a complaint. Returns the new complaint ID (e.g. CC-2026-0110). */
 export async function submitComplaintToDb(input: NewComplaintInput): Promise<string> {
