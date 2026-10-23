@@ -107,9 +107,18 @@ export async function loadStaff(): Promise<StaffRow[]> {
   return (data ?? []) as StaffRow[];
 }
 
+/** Database rules that the form normally enforces first; if one is still hit, explain it in plain words. */
+const CHECK_MESSAGES: Array<[RegExp, string]> = [
+  [/complaints_room_check/, "Room number must be 1 to 20 characters."],
+  [/complaints_description_check/, "The description must be 10 to 2000 characters."],
+  [/complaint_events_(note|reason)_check/, "That text is too long: the limit is 1000 characters."],
+  [/check constraint/i, "One of the values is not allowed. Please check the form and try again."],
+];
+
 /** Turns a database error into the plain sentence the database function raised. */
 function cleanError(error: { message?: string } | null): string {
   const msg = (error?.message ?? "").trim();
+  for (const [pattern, text] of CHECK_MESSAGES) if (pattern.test(msg)) return text;
   return msg || "The change could not be saved. Please try again.";
 }
 

@@ -129,6 +129,18 @@ const workflow: Status[] = ["Submitted", "Under Review", "Assigned", "In Progres
 /** Proposed demo policy, not an existing college rule. */
 const NO_RESPONSE_DAYS = 3;
 const MIN_REASON = 10;
+/** Same limits as the database (supabase/schema.sql), so a too-long entry is stopped while typing, not when saving. */
+const LIMITS = { room: 20, description: 2000, reason: 1000, note: 1000, comment: 900 } as const;
+
+/** "123 / 1000" under a text box; turns amber near the limit. */
+function CharCount({ value, max }: { value: string; max: number }) {
+  const near = value.length >= max * 0.9;
+  return (
+    <p aria-live="polite" className={`mt-1 text-right text-xs ${near ? "font-semibold text-amber-600 dark:text-amber-400" : "text-slate-400 dark:text-slate-500"}`}>
+      {value.length} / {max}
+    </p>
+  );
+}
 
 /* ------------------------------------------------------------------ */
 /* Lifecycle rules                                                     */
@@ -290,6 +302,11 @@ function busyFor(staff: string, items: Complaint[], excludeId?: string): Visit[]
 function greeting() {
   const h = new Date().getHours();
   return h < 12 ? "Good morning" : h < 17 ? "Good afternoon" : "Good evening";
+}
+/** "2026-11-06" → "Fri, 6 Nov" */
+function fmtDayShort(isoDay: string) {
+  const [y, m, d] = isoDay.split("-").map(Number);
+  return new Date(y, m - 1, d).toLocaleDateString("en-IN", { weekday: "short", day: "numeric", month: "short" });
 }
 function todayLabel() {
   return new Date().toLocaleDateString("en-IN", { weekday: "long", day: "numeric", month: "long" });
@@ -988,11 +1005,16 @@ function ReasonForm({
         <textarea
           autoFocus
           className={`${fieldClass} min-h-24 ${error ? "border-red-300 dark:border-red-500/50" : ""}`}
-          onChange={(event) => setReason(event.target.value)}
+          maxLength={LIMITS.reason}
+          onChange={(event) => {
+            setReason(event.target.value);
+            if (error && event.target.value.trim().length >= MIN_REASON) setError("");
+          }}
           placeholder={placeholder}
           value={reason}
         />
       </Field>
+      <CharCount max={LIMITS.reason} value={reason} />
       <FieldError message={error} />
       <div className="flex gap-2">
         <Button
@@ -1021,16 +1043,21 @@ function ReasonForm({
 /* ------------------------------------------------------------------ */
 
 function Login() {
-  const [email, setEmail] = useState(DEMO_ACCOUNTS[0].email);
+  const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
-  const quick = [DEMO_ACCOUNTS[0], DEMO_ACCOUNTS[2], DEMO_ACCOUNTS[3], DEMO_ACCOUNTS[4]];
+  const [demoOpen, setDemoOpen] = useState(false);
+  const passwordRef = useRef<HTMLInputElement>(null);
 
   const signIn = async (event: FormEvent) => {
     event.preventDefault();
     if (!supabase) return;
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
+      setError("Enter a valid email address, for example name@campuscare.demo.");
+      return;
+    }
     setBusy(true);
     setError("");
     const { error: authError } = await supabase.auth.signInWithPassword({ email: email.trim(), password });
@@ -1086,59 +1113,34 @@ function Login() {
           <div className="mb-8">
             <p className="text-sm font-semibold text-blue-600 dark:text-blue-400">Welcome</p>
             <h2 className="mt-2 text-3xl font-bold tracking-tight text-slate-900 dark:text-slate-50">Sign in to CampusCare</h2>
-            <p className="mt-2 text-slate-500 dark:text-slate-400">Everyone signs in here with their own account. Students and faculty use the same screens; your account decides your role.</p>
           </div>
-          <p className="mb-2 text-xs font-bold uppercase tracking-widest text-slate-400 dark:text-slate-500">Demo accounts</p>
-          <div className="grid gap-3 sm:grid-cols-2">
-            {quick.map((item) => (
-              <button
-                className={`flex w-full items-center gap-3 rounded-2xl border p-3 text-left transition ${
-                  email === item.email
-                    ? "border-blue-500 bg-blue-50 dark:bg-blue-500/10 ring-4 ring-blue-50 dark:ring-blue-500/20"
-                    : "border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 hover:border-slate-300 dark:hover:border-slate-600"
-                }`}
-                key={item.email}
-                onClick={() => setEmail(item.email)}
-                type="button"
-              >
-                <span
-                  className={`grid size-10 shrink-0 place-items-center rounded-xl ${
-                    email === item.email ? "bg-blue-600 text-white" : "bg-slate-100 dark:bg-slate-800 text-slate-600 dark:text-slate-300"
-                  }`}
-                >
-                  <Icon name={item.icon} />
-                </span>
-                <span className="min-w-0 flex-1">
-                  <span className="block truncate text-sm font-semibold text-slate-900 dark:text-slate-50">{item.label}</span>
-                  <span className="mt-0.5 block truncate text-xs text-slate-500 dark:text-slate-400">{item.name}</span>
-                </span>
-              </button>
-            ))}
-          </div>
-          <form className="mt-5 space-y-4" noValidate onSubmit={signIn}>
+          <form className="space-y-4" noValidate onSubmit={signIn}>
             <Field label="Email">
               <input
                 autoComplete="username"
                 className={fieldClass}
-                list="campuscare-demo-accounts"
-                onChange={(event) => setEmail(event.target.value)}
+                inputMode="email"
+                maxLength={254}
+                onChange={(event) => {
+                  setEmail(event.target.value);
+                  setError("");
+                }}
+                placeholder="name@campuscare.demo"
                 type="email"
                 value={email}
               />
-              <datalist id="campuscare-demo-accounts">
-                {DEMO_ACCOUNTS.map((a) => (
-                  <option key={a.email} value={a.email}>
-                    {a.name} · {a.label}
-                  </option>
-                ))}
-              </datalist>
             </Field>
             <Field label="Password">
               <div className="relative">
                 <input
                   autoComplete="current-password"
                   className={`${fieldClass} pr-12`}
-                  onChange={(event) => setPassword(event.target.value)}
+                  maxLength={128}
+                  onChange={(event) => {
+                    setPassword(event.target.value);
+                    setError("");
+                  }}
+                  ref={passwordRef}
                   type={showPassword ? "text" : "password"}
                   value={password}
                 />
@@ -1162,12 +1164,48 @@ function Login() {
               {busy ? "Signing in…" : "Sign in"} {!busy && <Icon name="arrow" className="size-4" />}
             </Button>
           </form>
-          <p className="mt-5 text-center text-xs leading-5 text-slate-500 dark:text-slate-400">
-            Demo accounts are fictional. Other staff logins can be typed into the email box.
-          </p>
-          <p className="mt-2 text-center text-xs text-slate-500 dark:text-slate-400">
-            Live database: <span className="font-semibold">{supabaseProjectHost}</span>
-          </p>
+          <div className="mt-6 border-t border-slate-200 dark:border-slate-800 pt-4">
+            <button
+              aria-controls="demo-accounts"
+              aria-expanded={demoOpen}
+              className="flex w-full items-center justify-between rounded-xl px-1 py-1.5 text-sm font-semibold text-slate-600 dark:text-slate-300 hover:text-slate-900 dark:hover:text-white"
+              onClick={() => setDemoOpen((v) => !v)}
+              type="button"
+            >
+              Use a demo account
+              <Icon className={`size-4 transition ${demoOpen ? "rotate-90" : ""}`} name="arrow" />
+            </button>
+            {demoOpen && (
+              <div className="mt-2" id="demo-accounts">
+                <p className="mb-2 px-1 text-xs leading-5 text-slate-500 dark:text-slate-400">
+                  For the prototype demonstration. Choosing one fills in the email; the password is shared with evaluators separately. All demo people are fictional.
+                </p>
+                <ul className="divide-y divide-slate-100 dark:divide-slate-800 overflow-hidden rounded-xl border border-slate-200 dark:border-slate-800">
+                  {DEMO_ACCOUNTS.map((item) => (
+                    <li key={item.email}>
+                      <button
+                        className={`flex w-full items-center justify-between gap-3 px-3 py-2.5 text-left text-sm transition ${
+                          email === item.email ? "bg-blue-50 dark:bg-blue-500/10" : "bg-white dark:bg-slate-900 hover:bg-slate-50 dark:hover:bg-slate-800"
+                        }`}
+                        onClick={() => {
+                          setEmail(item.email);
+                          setError("");
+                          passwordRef.current?.focus();
+                        }}
+                        type="button"
+                      >
+                        <span className="font-semibold text-slate-800 dark:text-slate-100">{item.name}</span>
+                        <span className="shrink-0 text-xs text-slate-500 dark:text-slate-400">{item.label}</span>
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+                <p className="mt-2 px-1 text-xs text-slate-500 dark:text-slate-400">
+                  Connected to: <span className="font-semibold">{supabaseProjectHost}</span>
+                </p>
+              </div>
+            )}
+          </div>
         </div>
       </section>
     </main>
@@ -1618,6 +1656,7 @@ function ReportForm({ onSubmit }: { onSubmit: (data: NewComplaint) => void }) {
               <Field label="Room number">
                 <input
                   className={`${fieldClass} ${invalid("room")}`}
+                  maxLength={LIMITS.room}
                   onChange={(event) => edit("room", setRoom, event.target.value)}
                   placeholder="Enter room number (e.g., 204)"
                   value={room}
@@ -1633,11 +1672,13 @@ function ReportForm({ onSubmit }: { onSubmit: (data: NewComplaint) => void }) {
             >
               <textarea
                 className={`${fieldClass} min-h-36 resize-y ${invalid("description")}`}
+                maxLength={LIMITS.description}
                 onChange={(event) => edit("description", setDescription, event.target.value)}
                 placeholder="What happened? When did you first notice it? Include anything that could help the team respond."
                 value={description}
               />
             </Field>
+            <CharCount max={LIMITS.description} value={description} />
             <FieldError message={errors.description} />
           </div>
           <div className="mt-5">
@@ -1918,8 +1959,11 @@ function VisitPicker({
   const [days, setDays] = useState(() => value?.days ?? 1);
   const [y, m, d] = day.split("-").map(Number);
   const base = new Date(y, (m || 1) - 1, d || 1);
+  const minDay = toInputDate(now);
+  const maxDay = toInputDate(dayAt(new Date(), 14, 0));
+  const outOfRange = !day || day < minDay || day > maxDay; // YYYY-MM-DD strings compare correctly
   const slots: Array<Visit & { taken: boolean }> = [];
-  for (let h = WORK_START_HOUR; h + hours <= WORK_END_HOUR; h++) {
+  for (let h = WORK_START_HOUR; !outOfRange && h + hours <= WORK_END_HOUR; h++) {
     const start = dayAt(base, 0, h);
     if (start <= now) continue;
     const slot: Visit = { start, end: start + hours * HOUR, days };
@@ -1931,8 +1975,8 @@ function VisitPicker({
       <Field hint={`Optional. Hours ${WORK_START_HOUR}:00–${WORK_END_HOUR}:00 are a placeholder for the prototype.`} label={days > 1 ? "First visit day" : "Visit day"}>
         <input
           className={fieldClass}
-          max={toInputDate(dayAt(new Date(), 14, 0))}
-          min={toInputDate(now)}
+          max={maxDay}
+          min={minDay}
           onChange={(event) => {
             if (event.target.value) {
               setDay(event.target.value);
@@ -2006,7 +2050,11 @@ function VisitPicker({
           })}
         </div>
       ) : (
-        <p className="text-sm text-slate-500 dark:text-slate-400">No start times left on this day for a {hours}-hour visit. Choose another day or a shorter visit.</p>
+        <p className="text-sm text-slate-500 dark:text-slate-400" role={outOfRange ? "alert" : undefined}>
+          {outOfRange
+            ? `Choose a day between today and ${fmtDayShort(maxDay)}: visits can be booked up to 14 days ahead.`
+            : `No start times left on this day for a ${hours}-hour visit. Choose another day or a shorter visit.`}
+        </p>
       )}
       <p className="text-xs text-slate-500 dark:text-slate-400">
         {value ? (
@@ -2331,11 +2379,16 @@ function MaintenanceActions({ item, user, act }: { item: Complaint; user: string
         <Field hint={`Required, at least ${MIN_REASON} characters.`} label="Resolution note">
           <textarea
             className={`${fieldClass} min-h-28 ${error ? "border-red-300 dark:border-red-500/50" : ""}`}
-            onChange={(event) => setNote(event.target.value)}
+            maxLength={LIMITS.note}
+            onChange={(event) => {
+              setNote(event.target.value);
+              if (error && event.target.value.trim().length >= MIN_REASON) setError("");
+            }}
             placeholder="Describe the work completed…"
             value={note}
           />
         </Field>
+        <CharCount max={LIMITS.note} value={note} />
         <FieldError message={error} />
         <div>
           <span className="mb-2 block text-sm font-semibold text-slate-700 dark:text-slate-200">Evidence</span>
@@ -2878,11 +2931,13 @@ function Feedback({ item, navigate, act }: { item: Complaint; navigate: (view: V
               <Field label="Comment (optional)">
                 <textarea
                   className={`${fieldClass} min-h-24`}
+                  maxLength={LIMITS.comment}
                   onChange={(event) => setComment(event.target.value)}
                   placeholder="Anything the team should know?"
                   value={comment}
                 />
               </Field>
+              <CharCount max={LIMITS.comment} value={comment} />
             </div>
             <div className="mt-7 grid gap-3 sm:grid-cols-2">
               <Button
