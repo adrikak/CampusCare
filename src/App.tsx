@@ -1,6 +1,18 @@
-import { useCallback, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
-import { supabase, supabaseConfigError } from "./lib/supabase";
-import { loadComplaintData, loadMyProfile, type ComplaintRow, type EventRow, type ProfileRow } from "./lib/data";
+import { createContext, useCallback, useContext, useEffect, useMemo, useRef, useState, type FormEvent, type ReactNode } from "react";
+import { supabase, supabaseConfigError, supabaseProjectHost } from "./lib/supabase";
+import {
+  loadComplaintData,
+  loadMyProfile,
+  loadStaff,
+  performAction,
+  submitComplaintToDb,
+  type ComplaintRow,
+  type EventRow,
+  type ProfileRow,
+  type NewComplaintInput,
+  type StaffRow,
+} from "./lib/data";
+import { PDF_MAX_BYTES, PHOTO_PICK_MAX_BYTES, signedUrl, uploadEvidence } from "./lib/files";
 
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
@@ -19,8 +31,12 @@ type View =
 type Status = "Submitted" | "Under Review" | "Assigned" | "In Progress" | "Resolved" | "Closed";
 type Priority = "Not set" | "Low" | "Medium" | "High" | "Urgent";
 type Requester = { name: string; role: "Student" | "Faculty" };
-/** previewUrl exists only in this browser session (object URL); nothing is uploaded. */
-type Evidence = { name: string; size: string; previewUrl?: string };
+/**
+ * previewUrl: local preview of a file chosen in this browser (object URL).
+ * file: the chosen file, uploaded when the form is submitted.
+ * path / thumb: where a stored file lives in the private evidence bucket.
+ */
+type Evidence = { name: string; size: string; previewUrl?: string; file?: File; path?: string; thumb?: string | null };
 /** start/end are the first day's block; the same block repeats for `days` consecutive days. */
 type Visit = { start: number; end: number; days?: number };
 
@@ -100,6 +116,9 @@ const categoryTeam: Record<string, string> = {
   HVAC: "General Maintenance",
   Other: "General Maintenance",
 };
+
+/** Maintenance staff loaded from the database (id, name, team). The assign lists use this, not the names above. */
+const StaffContext = createContext<StaffRow[]>([]);
 
 const categories = ["Electrical", "Plumbing", "IT & Network", "Furniture", "Cleanliness", "Safety", "HVAC", "Other"];
 const buildings = ["A1", "A2", "B", "C", "D"];
@@ -511,7 +530,9 @@ function toComplaints(rows: ComplaintRow[], events: EventRow[]): Complaint[] {
       byRole: e.actor_role,
       note: e.note ?? undefined,
       reason: e.reason ?? undefined,
-      evidence: e.evidence_name ? { name: e.evidence_name, size: e.evidence_size != null ? formatSize(e.evidence_size) : "" } : undefined,
+      evidence: e.evidence_name
+        ? { name: e.evidence_name, size: e.evidence_size != null ? formatSize(e.evidence_size) : "", path: e.evidence_path ?? undefined, thumb: e.evidence_thumb }
+        : undefined,
     });
     byComplaint.set(e.complaint_id, list);
   }
@@ -531,7 +552,7 @@ function toComplaints(rows: ComplaintRow[], events: EventRow[]): Complaint[] {
     team: r.team ?? undefined,
     assignee: r.assignee_name ?? undefined,
     attachment: r.attachment_name
-      ? { name: r.attachment_name, size: r.attachment_size != null ? formatSize(r.attachment_size) : "" }
+      ? { name: r.attachment_name, size: r.attachment_size != null ? formatSize(r.attachment_size) : "", path: r.attachment_path ?? undefined, thumb: r.attachment_thumb }
       : undefined,
     visit:
       r.visit_start && r.visit_end
@@ -562,6 +583,18 @@ const DEMO_ACCOUNTS: Array<{ label: string; name: string; email: string; icon: s
 /* ------------------------------------------------------------------ */
 
 const iconPaths: Record<string, ReactNode> = {
+  eye: (
+    <>
+      <path d="M2 12s3.5-7 10-7 10 7 10 7-3.5 7-10 7S2 12 2 12Z" />
+      <circle cx="12" cy="12" r="3" />
+    </>
+  ),
+  eyeOff: (
+    <>
+      <path d="M10.6 5.1A10.4 10.4 0 0 1 12 5c6.5 0 10 7 10 7a17.6 17.6 0 0 1-3.2 4.2M6.6 6.6C3.7 8.5 2 12 2 12s3.5 7 10 7a9.7 9.7 0 0 0 5.4-1.6" />
+      <path d="M9.9 9.9a3 3 0 0 0 4.2 4.2M3 3l18 18" />
+    </>
+  ),
   logo: (
     <>
       <path d="M12 3 4 7v5c0 4.5 3.4 7.9 8 9 4.6-1.1 8-4.5 8-9V7l-8-4Z" />
@@ -781,15 +814,18 @@ function initials(name: string) {
 
 const ALLOWED_EXTENSIONS = ["jpg", "jpeg", "png", "pdf"];
 const ALLOWED_TYPES = ["image/jpeg", "image/png", "application/pdf"];
-const MAX_FILE_BYTES = 10 * 1024 * 1024;
+const FILE_HINT = "Photos (JPG, PNG) are shrunk automatically to 500 KB or less · PDF up to 2 MB";
 
 function validateFile(file: File): string {
   const extension = file.name.split(".").pop()?.toLowerCase() ?? "";
   if (!ALLOWED_EXTENSIONS.includes(extension) || (file.type && !ALLOWED_TYPES.includes(file.type))) {
-    return `“${file.name}” is not a supported format. Please upload a JPG, JPEG, PNG or PDF file.`;
+    return `“${file.name}” was not attached because it is not a supported format. Choose a JPG, JPEG, PNG or PDF file, or submit without a file.`;
   }
-  if (file.size > MAX_FILE_BYTES) {
-    return `“${file.name}” is larger than 10 MB. Please choose a smaller file.`;
+  if (extension === "pdf" && file.size > PDF_MAX_BYTES) {
+    return `“${file.name}” was not attached because PDFs can be at most 2 MB. Choose a smaller PDF, or submit without a file.`;
+  }
+  if (file.size > PHOTO_PICK_MAX_BYTES) {
+    return `“${file.name}” was not attached because it is larger than 10 MB. Choose a smaller photo, or submit without a file.`;
   }
   return "";
 }
@@ -818,6 +854,59 @@ function previewFor(file: File) {
   return file.type.startsWith("image/") ? URL.createObjectURL(file) : undefined;
 }
 
+/** A stored evidence file: thumbnail through a short-lived signed link, and a link to open the full file. */
+function StoredEvidence({ evidence, from, tone = "blue" }: { evidence: Evidence; from: string; tone?: "blue" | "emerald" }) {
+  const [thumbUrl, setThumbUrl] = useState<string | null>(null);
+  const [problem, setProblem] = useState("");
+  const [opening, setOpening] = useState(false);
+  useEffect(() => {
+    let active = true;
+    if (evidence.thumb) {
+      signedUrl(evidence.thumb)
+        .then((url) => active && setThumbUrl(url))
+        .catch(() => active && setThumbUrl(null));
+    }
+    return () => {
+      active = false;
+    };
+  }, [evidence.thumb]);
+  const openFile = async () => {
+    if (!evidence.path) return;
+    setOpening(true);
+    setProblem("");
+    try {
+      window.open(await signedUrl(evidence.path), "_blank", "noopener");
+    } catch (err) {
+      setProblem(err instanceof Error ? err.message : "The file could not be opened.");
+    } finally {
+      setOpening(false);
+    }
+  };
+  return (
+    <div className="mt-4 flex items-center gap-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 p-3">
+      {thumbUrl ? (
+        <img alt={`Evidence: ${evidence.name}`} className="size-20 shrink-0 rounded-lg object-cover ring-1 ring-slate-200 dark:ring-slate-700" src={thumbUrl} />
+      ) : (
+        <EvidenceThumb evidence={{ name: evidence.name, size: evidence.size }} size="size-10" tone={tone} />
+      )}
+      <div className="min-w-0 flex-1">
+        <p className="truncate text-sm font-semibold text-slate-800 dark:text-slate-100">{evidence.name}</p>
+        <p className="text-xs text-slate-500 dark:text-slate-400">
+          {evidence.size} · {from}
+        </p>
+        <FieldError message={problem} />
+      </div>
+      {evidence.path ? (
+        <Button disabled={opening} onClick={() => void openFile()} variant="ghost">
+          {opening ? "Opening…" : "Open"}
+        </Button>
+      ) : (
+        <span className="text-xs text-slate-500 dark:text-slate-400">File not stored</span>
+      )}
+    </div>
+  );
+}
+
 /** Compact evidence picker used by maintenance (same rules as the report form). */
 function EvidencePicker({ value, onChange }: { value: Evidence | null; onChange: (file: Evidence | null) => void }) {
   const [error, setError] = useState("");
@@ -828,7 +917,7 @@ function EvidencePicker({ value, onChange }: { value: Evidence | null; onChange:
         <EvidenceThumb evidence={value} size="size-12" />
         <div className="min-w-0 flex-1">
           <p className="truncate text-sm font-semibold text-slate-800 dark:text-slate-100">{value.name}</p>
-          <p className="text-xs text-slate-500 dark:text-slate-400">{value.size} · preview only, not uploaded</p>
+          <p className="text-xs text-slate-500 dark:text-slate-400">{value.size} · uploaded when you submit</p>
         </div>
         <Button
           onClick={() => {
@@ -862,13 +951,14 @@ function EvidencePicker({ value, onChange }: { value: Evidence | null; onChange:
               return;
             }
             setError("");
-            onChange({ name: file.name, size: formatSize(file.size), previewUrl: previewFor(file) });
+            onChange({ name: file.name, size: formatSize(file.size), previewUrl: previewFor(file), file });
           }}
           ref={inputRef}
           type="file"
         />
         <Icon name="upload" className="size-4 text-blue-600 dark:text-blue-400" /> Upload photo or PDF (optional)
       </label>
+      <p className="mt-1 text-xs text-slate-500 dark:text-slate-400">{FILE_HINT}</p>
       <FieldError message={error} />
     </>
   );
@@ -933,6 +1023,7 @@ function ReasonForm({
 function Login() {
   const [email, setEmail] = useState(DEMO_ACCOUNTS[0].email);
   const [password, setPassword] = useState("");
+  const [showPassword, setShowPassword] = useState(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const quick = [DEMO_ACCOUNTS[0], DEMO_ACCOUNTS[2], DEMO_ACCOUNTS[3], DEMO_ACCOUNTS[4]];
@@ -995,7 +1086,7 @@ function Login() {
           <div className="mb-8">
             <p className="text-sm font-semibold text-blue-600 dark:text-blue-400">Welcome</p>
             <h2 className="mt-2 text-3xl font-bold tracking-tight text-slate-900 dark:text-slate-50">Sign in to CampusCare</h2>
-            <p className="mt-2 text-slate-500 dark:text-slate-400">Use one of the demo accounts. Your role comes from your account.</p>
+            <p className="mt-2 text-slate-500 dark:text-slate-400">Everyone signs in here with their own account. Students and faculty use the same screens; your account decides your role.</p>
           </div>
           <p className="mb-2 text-xs font-bold uppercase tracking-widest text-slate-400 dark:text-slate-500">Demo accounts</p>
           <div className="grid gap-3 sm:grid-cols-2">
@@ -1043,13 +1134,28 @@ function Login() {
               </datalist>
             </Field>
             <Field label="Password">
-              <input
-                autoComplete="current-password"
-                className={fieldClass}
-                onChange={(event) => setPassword(event.target.value)}
-                type="password"
-                value={password}
-              />
+              <div className="relative">
+                <input
+                  autoComplete="current-password"
+                  className={`${fieldClass} pr-12`}
+                  onChange={(event) => setPassword(event.target.value)}
+                  type={showPassword ? "text" : "password"}
+                  value={password}
+                />
+                <button
+                  aria-label={showPassword ? "Hide password" : "Show password"}
+                  aria-pressed={showPassword}
+                  className="absolute inset-y-0 right-0 grid w-11 place-items-center rounded-r-xl text-slate-500 hover:text-slate-800 focus-visible:outline-2 focus-visible:outline-blue-500 dark:text-slate-400 dark:hover:text-slate-100"
+                  onClick={(event) => {
+                    event.preventDefault();
+                    setShowPassword((v) => !v);
+                  }}
+                  title={showPassword ? "Hide password" : "Show password"}
+                  type="button"
+                >
+                  <Icon className="size-5" name={showPassword ? "eyeOff" : "eye"} />
+                </button>
+              </div>
             </Field>
             <FieldError message={error} />
             <Button className="w-full" disabled={busy || !email.trim() || !password} type="submit">
@@ -1058,6 +1164,9 @@ function Login() {
           </form>
           <p className="mt-5 text-center text-xs leading-5 text-slate-500 dark:text-slate-400">
             Demo accounts are fictional. Other staff logins can be typed into the email box.
+          </p>
+          <p className="mt-2 text-center text-xs text-slate-500 dark:text-slate-400">
+            Live database: <span className="font-semibold">{supabaseProjectHost}</span>
           </p>
         </div>
       </section>
@@ -1171,7 +1280,7 @@ function AppHeader({ role, setOpen }: { role: Role; setOpen: (value: boolean) =>
       </button>
       <span className="inline-flex items-center gap-1.5 rounded-full bg-amber-50 dark:bg-amber-500/10 px-2.5 py-1 text-xs font-semibold text-amber-800 dark:text-amber-200 ring-1 ring-inset ring-amber-200 dark:ring-amber-500/30">
         <span className="size-1.5 rounded-full bg-amber-500" />
-        Live data<span className="hidden sm:inline"> · saving not switched on yet</span>
+        Live data<span className="hidden sm:inline"> · changes are saved</span>
       </span>
       <span className="hidden text-sm font-semibold text-slate-700 dark:text-slate-200 sm:block">
         {role === "student" ? "JSPM RSCOE" : role === "admin" ? "Admin portal" : "Maintenance team"}
@@ -1362,17 +1471,6 @@ function StudentDashboard({
           )}
         </section>
         <aside className="space-y-6">
-          <div className="relative overflow-hidden rounded-2xl bg-blue-600 p-6 text-white shadow-lg shadow-blue-200">
-            <div className="absolute -right-8 -top-8 size-32 rounded-full bg-white/10" />
-            <span className="grid size-11 place-items-center rounded-xl bg-white/15">
-              <Icon name="plus" />
-            </span>
-            <h2 className="mt-5 text-xl font-bold">Spot a campus issue?</h2>
-            <p className="mt-2 text-sm leading-6 text-blue-100">Send the right team all the details in just a few steps.</p>
-            <Button className="mt-5" onClick={() => navigate("report")} variant="inverse">
-              Start a report
-            </Button>
-          </div>
           <div className="rounded-2xl border border-slate-200 dark:border-slate-800 bg-white dark:bg-slate-900 p-5">
             <p className="font-bold text-slate-900 dark:text-slate-50">Need urgent help?</p>
             <p className="mt-2 text-sm leading-6 text-slate-500 dark:text-slate-400">
@@ -1380,7 +1478,7 @@ function StudentDashboard({
             </p>
           </div>
           <p className="px-1 text-xs leading-5 text-slate-500 dark:text-slate-400">
-            CampusCare is a prototype. All complaints shown here are simulated and live only in this browser session.
+            CampusCare is a Design Thinking prototype. Complaints are saved in the project database; all people and data are fictional.
           </p>
         </aside>
       </div>
@@ -1440,6 +1538,12 @@ function ReportForm({ onSubmit }: { onSubmit: (data: NewComplaint) => void }) {
     if (inputRef.current) inputRef.current.value = "";
   };
 
+  /** Updates a field and removes its error message as soon as the user changes it (checked again on submit). */
+  const edit = (key: string, set: (value: string) => void, value: string) => {
+    set(value);
+    if (errors[key]) setErrors(({ [key]: _removed, ...rest }) => rest);
+  };
+
   const submit = (event: FormEvent) => {
     event.preventDefault();
     const next: Record<string, string> = {};
@@ -1449,7 +1553,9 @@ function ReportForm({ onSubmit }: { onSubmit: (data: NewComplaint) => void }) {
     if (!room.trim()) next.room = "Please enter a room number.";
     if (description.trim().length < 10) next.description = "Please describe the issue in at least 10 characters.";
     setErrors(next);
-    if (Object.keys(next).length || fileError) return;
+    if (Object.keys(next).length) return;
+    // The file is optional: a refused file was never attached, so it does not block submitting.
+    if (fileError) setFileError("");
     submittedRef.current = true; // the new complaint now owns the preview
     onSubmit({ category, building, floor, room: room.trim(), description: description.trim(), file, previewUrl });
   };
@@ -1471,7 +1577,7 @@ function ReportForm({ onSubmit }: { onSubmit: (data: NewComplaint) => void }) {
           <div className="grid gap-5 sm:grid-cols-2">
             <div>
               <Field label="Category">
-                <select className={`${fieldClass} ${invalid("category")}`} onChange={(event) => setCategory(event.target.value)} value={category}>
+                <select className={`${fieldClass} ${invalid("category")}`} onChange={(event) => edit("category", setCategory, event.target.value)} value={category}>
                   <option disabled value="">
                     Select a category
                   </option>
@@ -1484,7 +1590,7 @@ function ReportForm({ onSubmit }: { onSubmit: (data: NewComplaint) => void }) {
             </div>
             <div>
               <Field label="Building">
-                <select className={`${fieldClass} ${invalid("building")}`} onChange={(event) => setBuilding(event.target.value)} value={building}>
+                <select className={`${fieldClass} ${invalid("building")}`} onChange={(event) => edit("building", setBuilding, event.target.value)} value={building}>
                   <option disabled value="">
                     Select a building
                   </option>
@@ -1497,7 +1603,7 @@ function ReportForm({ onSubmit }: { onSubmit: (data: NewComplaint) => void }) {
             </div>
             <div>
               <Field label="Floor">
-                <select className={`${fieldClass} ${invalid("floor")}`} onChange={(event) => setFloor(event.target.value)} value={floor}>
+                <select className={`${fieldClass} ${invalid("floor")}`} onChange={(event) => edit("floor", setFloor, event.target.value)} value={floor}>
                   <option disabled value="">
                     Select a floor
                   </option>
@@ -1512,7 +1618,7 @@ function ReportForm({ onSubmit }: { onSubmit: (data: NewComplaint) => void }) {
               <Field label="Room number">
                 <input
                   className={`${fieldClass} ${invalid("room")}`}
-                  onChange={(event) => setRoom(event.target.value)}
+                  onChange={(event) => edit("room", setRoom, event.target.value)}
                   placeholder="Enter room number (e.g., 204)"
                   value={room}
                 />
@@ -1527,7 +1633,7 @@ function ReportForm({ onSubmit }: { onSubmit: (data: NewComplaint) => void }) {
             >
               <textarea
                 className={`${fieldClass} min-h-36 resize-y ${invalid("description")}`}
-                onChange={(event) => setDescription(event.target.value)}
+                onChange={(event) => edit("description", setDescription, event.target.value)}
                 placeholder="What happened? When did you first notice it? Include anything that could help the team respond."
                 value={description}
               />
@@ -1541,7 +1647,7 @@ function ReportForm({ onSubmit }: { onSubmit: (data: NewComplaint) => void }) {
                 <EvidenceThumb evidence={{ name: file.name, size: formatSize(file.size), previewUrl }} size="size-16" />
                 <div className="min-w-0 flex-1">
                   <p className="truncate text-sm font-semibold text-slate-800 dark:text-slate-100">{file.name}</p>
-                  <p className="text-xs text-slate-500 dark:text-slate-400">{formatSize(file.size)} · Ready to attach · preview only, not uploaded</p>
+                  <p className="text-xs text-slate-500 dark:text-slate-400">{formatSize(file.size)} · Ready to upload{file.type.startsWith("image/") ? " (will be shrunk automatically)" : ""}</p>
                 </div>
                 <Button onClick={clearFile} variant="ghost">
                   Remove
@@ -1578,7 +1684,7 @@ function ReportForm({ onSubmit }: { onSubmit: (data: NewComplaint) => void }) {
                   <Icon name="upload" />
                 </span>
                 <span className="mt-3 text-sm font-semibold text-slate-700 dark:text-slate-200">Choose a file or drag it here</span>
-                <span className="mt-1 text-xs text-slate-500 dark:text-slate-400">JPG, JPEG, PNG or PDF · Maximum 10 MB</span>
+                <span className="mt-1 text-xs text-slate-500 dark:text-slate-400">{FILE_HINT}</span>
               </label>
             )}
             <FieldError message={fileError} />
@@ -1609,8 +1715,7 @@ function ReportForm({ onSubmit }: { onSubmit: (data: NewComplaint) => void }) {
             </ol>
           </div>
           <p className="px-2 text-xs leading-5 text-slate-500 dark:text-slate-400">
-            Prototype notice: reports in this demo are stored only in the current browser session and are not sent to a real campus team. Files are not
-            uploaded anywhere.
+            Prototype notice: reports and attached files are saved in the CampusCare demo database and are not sent to a real campus team.
           </p>
         </aside>
       </div>
@@ -1644,7 +1749,7 @@ function Confirmation({ item, navigate, onOpen }: { item: Complaint; navigate: (
             Return to overview
           </Button>
         </div>
-        <p className="mt-6 text-xs text-slate-400 dark:text-slate-500">Demo ID generated locally. No data was sent to a server.</p>
+        <p className="mt-6 text-xs text-slate-400 dark:text-slate-500">Saved in the CampusCare demo database. All people and data in this demo are fictional.</p>
       </div>
     </div>
   );
@@ -1780,7 +1885,7 @@ type ActFn = (
   id: string,
   action: Action,
   payload?: { note?: string; reason?: string; evidence?: Evidence; patch?: Partial<Complaint>; title?: string; extra?: ExtraEvent[] },
-) => boolean;
+) => Promise<boolean>;
 
 function Panel({ title, children }: { title: string; children: ReactNode }) {
   return (
@@ -1932,7 +2037,9 @@ function AssignFields({
   staff: string;
   setStaff: (v: string) => void;
 }) {
-  const members = staffDirectory.filter((s) => s.team === team);
+  const members = useContext(StaffContext)
+    .filter((s) => s.team === team)
+    .map((s) => ({ name: s.full_name }));
   return (
     <>
       <Field label="Team">
@@ -2385,18 +2492,7 @@ function ComplaintDetail({
               <p className="text-xs font-semibold uppercase tracking-wider text-slate-500 dark:text-slate-400">Description</p>
               <p className="mt-2 text-sm leading-7 text-slate-600 dark:text-slate-300">{item.description}</p>
             </div>
-            {item.attachment && (
-              <div className="mt-5 flex items-center gap-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 p-3">
-                <EvidenceThumb evidence={item.attachment} size={item.attachment.previewUrl ? "size-20" : "size-10"} />
-                <div className="min-w-0 flex-1">
-                  <p className="truncate text-sm font-semibold text-slate-800 dark:text-slate-100">{item.attachment.name}</p>
-                  <p className="text-xs text-slate-500 dark:text-slate-400">
-                    {item.attachment.size} · Evidence from requester ·{" "}
-                    {item.attachment.previewUrl ? "preview from this browser session, not uploaded" : "file name only, not uploaded in this prototype"}
-                  </p>
-                </div>
-              </div>
-            )}
+            {item.attachment && <StoredEvidence evidence={item.attachment} from="Evidence from requester" />}
           </section>
           {resolution && (
             <section className="rounded-2xl border border-emerald-200 dark:border-emerald-500/30 bg-white dark:bg-slate-900 p-5 sm:p-7">
@@ -2408,15 +2504,7 @@ function ComplaintDetail({
               </div>
               <p className="mt-3 text-sm leading-7 text-slate-700 dark:text-slate-200">{resolution.note}</p>
               {resolution.evidence ? (
-                <div className="mt-4 flex items-center gap-3 rounded-xl border border-slate-200 dark:border-slate-800 bg-slate-50 dark:bg-slate-950 p-3">
-                  <EvidenceThumb evidence={resolution.evidence} size={resolution.evidence.previewUrl ? "size-20" : "size-10"} tone="emerald" />
-                  <div className="min-w-0 flex-1">
-                    <p className="truncate text-sm font-semibold text-slate-800 dark:text-slate-100">{resolution.evidence.name}</p>
-                    <p className="text-xs text-slate-500 dark:text-slate-400">{resolution.evidence.size} · Evidence from maintenance ·{" "}
-                      {resolution.evidence.previewUrl ? "preview from this browser session, not uploaded" : "file name only, not uploaded in this prototype"}
-                    </p>
-                  </div>
-                </div>
+                <StoredEvidence evidence={resolution.evidence} from="Evidence from maintenance" tone="emerald" />
               ) : (
                 <p className="mt-3 text-xs text-slate-500 dark:text-slate-400">No evidence file attached.</p>
               )}
@@ -2759,7 +2847,7 @@ function Feedback({ item, navigate, act }: { item: Complaint; navigate: (view: V
               label="What is still wrong?"
               onCancel={() => setReopening(false)}
               onConfirm={(reason) => {
-                if (act(item.id, "reopened", { reason })) setDone("reopened");
+                void act(item.id, "reopened", { reason }).then((ok) => ok && setDone("reopened"));
               }}
               placeholder="e.g. The AC still is not cooling after 30 minutes."
               variant="danger"
@@ -2800,7 +2888,7 @@ function Feedback({ item, navigate, act }: { item: Complaint; navigate: (view: V
               <Button
                 onClick={() => {
                   const parts = [rating ? `Rated ${rating}/5.` : "", comment.trim() ? `“${comment.trim()}”` : ""].filter(Boolean);
-                  if (act(item.id, "confirmed", { note: parts.join(" ") || undefined })) setDone("closed");
+                  void act(item.id, "confirmed", { note: parts.join(" ") || undefined }).then((ok) => ok && setDone("closed"));
                 }}
               >
                 <Icon name="check" className="size-4" /> Confirm fixed
@@ -2854,6 +2942,16 @@ export default function App() {
   const [items, setItems] = useState<Complaint[]>([]);
   const [selectedId, setSelectedId] = useState<string>("");
   const [notice, setNotice] = useState("");
+  // Redraw once a minute so time-based text (greeting, today's date, "2 h ago") stays current on an open screen.
+  const [, setClockTick] = useState(0);
+  useEffect(() => {
+    const timer = window.setInterval(() => setClockTick((t) => t + 1), 60_000);
+    return () => window.clearInterval(timer);
+  }, []);
+  const [noticeTone, setNoticeTone] = useState<"info" | "error">("info");
+  const [staff, setStaff] = useState<StaffRow[]>([]);
+  const [saving, setSaving] = useState(""); // "" = idle, otherwise the progress message shown
+  const savingRef = useRef(false);
 
   // Keep the session (it survives a page refresh) and react to sign-in / sign-out.
   useEffect(() => {
@@ -2881,11 +2979,18 @@ export default function App() {
     setLoadError("");
     try {
       const me = await loadMyProfile(userId);
-      const data = await loadComplaintData();
+      const [data, staffRows] = await Promise.all([loadComplaintData(), loadStaff()]);
       setProfile(me);
+      setStaff(staffRows);
       setItems(toComplaints(data.complaints, data.events));
       setLoad("ready");
+      // Safe diagnostics: no passwords, tokens or keys.
+      console.info(
+        `[CampusCare] ${supabaseProjectHost} · signed in as ${me.email} (${me.role}${me.team ? `, ${me.team}` : ""}) · ` +
+          `${data.complaints.length} complaint(s), ${data.events.length} timeline event(s): ${data.complaints.map((c) => c.id).join(", ") || "none"}`,
+      );
     } catch (err) {
+      console.error("[CampusCare] Loading failed:", err instanceof Error ? err.message : err);
       setLoadError(err instanceof Error ? err.message : "Something went wrong while loading.");
       setLoad("error");
     }
@@ -2914,7 +3019,7 @@ export default function App() {
   }
   if (auth === "checking") return <StatusScreen message="Checking your sign-in…" title="Loading" />;
   if (auth === "signedOut") return <Login />;
-  if (load === "loading" && !profile) return <StatusScreen message="Loading your complaints…" title="Loading" />;
+  if (load === "loading" && !profile) return <StatusScreen message="Loading your dashboard…" title="Loading" />;
   if (load === "error" || !profile) {
     return (
       <StatusScreen
@@ -2955,16 +3060,93 @@ export default function App() {
     setView("detail");
   };
 
-  // Phase 1 is read-only: nothing is saved yet, so actions explain that instead of pretending to work.
-  const READ_ONLY_NOTICE = "Saving changes is not switched on yet. This version only shows live data from the database.";
-  const act: ActFn = () => {
-    setNotice(READ_ONLY_NOTICE);
+  const showNotice = (text: string, tone: "info" | "error") => {
+    setNotice(text);
+    setNoticeTone(tone);
     window.scrollTo({ top: 0, behavior: "smooth" });
-    return false;
   };
-  const submitComplaint = (_data: NewComplaint) => {
-    setNotice(READ_ONLY_NOTICE);
-    window.scrollTo({ top: 0, behavior: "smooth" });
+
+  /** Saves one lifecycle step through the database function perform_action, then reloads from the database. */
+  const act: ActFn = async (id, action, payload = {}) => {
+    if (savingRef.current) return false;
+    const patch = payload.patch ?? {};
+    const visitParams = (v?: Visit) =>
+      v ? { visit_start: new Date(v.start).toISOString(), visit_hours: Math.round((v.end - v.start) / 3_600_000), visit_days: v.days ?? 1 } : {};
+    const p: Record<string, unknown> = {};
+    if (action === "reviewStarted") p.priority = patch.priority;
+    else if (action === "assigned" || action === "reassigned") {
+      const member = staff.find((s) => s.full_name === patch.assignee);
+      if (!member) {
+        showNotice("That staff member was not found in the database. Refresh the page and try again.", "error");
+        return false;
+      }
+      p.assignee = member.id;
+      if (action === "assigned") Object.assign(p, visitParams(patch.visit));
+    } else if (action === "visitScheduled") Object.assign(p, visitParams(patch.visit));
+    else if (action === "resolutionSubmitted" || action === "confirmed") {
+      if (payload.note) p.note = payload.note;
+    } else if (payload.reason) p.reason = payload.reason;
+
+    savingRef.current = true;
+    setSaving("Saving…");
+    try {
+      // Evidence is uploaded first; the database only records files that are already stored.
+      if (action === "resolutionSubmitted" && payload.evidence?.file && profile) {
+        setSaving("Uploading file…");
+        const stored = await uploadEvidence(profile.id, payload.evidence.file);
+        Object.assign(p, { evidence_path: stored.path, evidence_thumb: stored.thumb, evidence_name: stored.name, evidence_size: stored.size });
+        setSaving("Saving…");
+      }
+      await performAction(id, action, p);
+      console.info(`[CampusCare] saved ${action} on ${id}`);
+      await reload();
+      setNotice("");
+      return true;
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "The change could not be saved.";
+      console.error(`[CampusCare] ${action} on ${id} failed:`, message);
+      showNotice(`Not saved: ${message}`, "error");
+      return false;
+    } finally {
+      savingRef.current = false;
+      setSaving("");
+    }
+  };
+
+  /** Saves a new complaint through the database function submit_complaint. */
+  const submitComplaint = async (data: NewComplaint) => {
+    if (savingRef.current) return;
+    savingRef.current = true;
+    setSaving("Saving…");
+    try {
+      let file: Partial<NewComplaintInput> = {};
+      if (data.file && profile) {
+        setSaving("Uploading file…");
+        const stored = await uploadEvidence(profile.id, data.file);
+        file = { attachment_path: stored.path, attachment_thumb: stored.thumb, attachment_name: stored.name, attachment_size: stored.size };
+        setSaving("Saving…");
+      }
+      const newId = await submitComplaintToDb({
+        category: data.category,
+        building: data.building,
+        floor: data.floor,
+        room: data.room,
+        description: data.description,
+        ...file,
+      });
+      console.info(`[CampusCare] submitted ${newId}`);
+      await reload();
+      setSelectedId(newId);
+      setView("confirmation");
+      setNotice("");
+    } catch (err) {
+      const message = err instanceof Error ? err.message : "The complaint could not be saved.";
+      console.error("[CampusCare] submit failed:", message);
+      showNotice(`Not saved: ${message}`, "error");
+    } finally {
+      savingRef.current = false;
+      setSaving("");
+    }
   };
 
   const renderView = () => {
@@ -3005,7 +3187,11 @@ export default function App() {
         <main className="mx-auto max-w-screen-2xl p-4 sm:p-8">
           {notice && (
             <div
-              className="mb-6 flex items-start justify-between gap-3 rounded-2xl border border-amber-200 dark:border-amber-500/30 bg-amber-50 dark:bg-amber-500/10 p-4 text-sm text-amber-900 dark:text-amber-100"
+              className={`mb-6 flex items-start justify-between gap-3 rounded-2xl border p-4 text-sm ${
+                noticeTone === "error"
+                  ? "border-red-200 dark:border-red-500/30 bg-red-50 dark:bg-red-500/10 text-red-800 dark:text-red-100"
+                  : "border-amber-200 dark:border-amber-500/30 bg-amber-50 dark:bg-amber-500/10 text-amber-900 dark:text-amber-100"
+              }`}
               role="alert"
             >
               <p>{notice}</p>
@@ -3014,12 +3200,12 @@ export default function App() {
               </button>
             </div>
           )}
-          {load === "loading" && (
+          {(saving || load === "loading") && (
             <p className="mb-4 text-xs font-medium text-slate-500 dark:text-slate-400" role="status">
-              Refreshing…
+              {saving || "Refreshing…"}
             </p>
           )}
-          {renderView()}
+          <StaffContext.Provider value={staff}>{renderView()}</StaffContext.Provider>
         </main>
       </div>
     </div>
