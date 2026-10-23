@@ -2,6 +2,8 @@
 
 A responsive campus infrastructure complaint reporting and resolution management system.
 
+**Live demo:** [campus-care-neon.vercel.app](https://campus-care-neon.vercel.app/) (fictional demo accounts; the demo password is shared with evaluators separately)
+
 ## 📌 Overview
 
 CampusCare aims to simplify how students and faculty report campus infrastructure issues and how administrators and maintenance staff manage their resolution. It provides a centralized workflow for submitting complaints, tracking progress, assigning staff, and recording resolution feedback.
@@ -36,9 +38,11 @@ Campus infrastructure complaints may be communicated through fragmented channels
 | Sign-in with Supabase Auth (demo accounts; role comes from the database) | Working |
 | Role-based views for students/faculty, admin and maintenance | Working |
 | Submitting complaints and every lifecycle step (review, assign, visit scheduling, work, resolution, confirm, reopen, close, reject) | Working, saved in the database |
-| Row-level security and server-side lifecycle rules | Working |
-| Evidence uploads (photos and PDFs) | Not yet. Files can be picked but are not uploaded. |
-| Deployment | Not yet |
+| Evidence photos and PDFs (photos shrunk in the browser to 500 KB or less; PDFs up to 2 MB; private storage with temporary links) | Working |
+| Field validation with limits matching the database (room 20, description 2000, reasons/notes 1000 characters) | Working |
+| Row-level security, storage rules and server-side lifecycle rules | Working |
+| Deployment | Live on Vercel (free plan) at https://campus-care-neon.vercel.app, connected to Supabase |
+| Email/push notifications | Planned |
 
 All people and complaints in the demo database are fictional.
 
@@ -72,17 +76,22 @@ Open the local URL printed in the terminal and sign in with one of the demo acco
 
 ## 📁 Repository layout
 
-- `src/`: the web app (`App.tsx`, plus `lib/` for the Supabase connection and data access)
+- `src/`: the web app (`App.tsx`, plus `lib/` for the Supabase connection, data access and file uploads)
 - `supabase/schema.sql`: tables, lifecycle rules, row-level security and storage rules
 - `supabase/seed.sql`: nine fictional sample complaints for the demo accounts
 - `supabase/SETUP.md`: step-by-step database setup
 - `scripts/create-demo-users.mjs`: optional script to create the demo logins (run locally; reads the secret key from an environment variable, never from a file)
 
+## ✅ Testing
+
+- Lifecycle and role tests, upload tests and security tests run against a test copy of the database.
+- 19 test cases (Assignment 9) and 46 field-by-field tests covering every input: all pass.
+
 ## 🧭 Next Steps
 
-1. Evidence uploads to Supabase Storage.
-2. Deployment.
-3. Usability testing and final report.
+1. Email/push notifications on status changes.
+2. Suggest booking a visit for high-priority or room-access issues.
+3. Reports for campus management (recurring issues by building and category).
 
 ## 👩‍💻 Project
 
